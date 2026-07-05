@@ -82,7 +82,7 @@ pub struct PioBlocks {
 
 /// Create one engine per (block, sm) slot used by `topo`, in probe order.
 fn block_engines<P: Instance + Send>(
-    mut pio: Pio<'static, P>,
+    pio: Pio<'static, P>,
     probes: &[ProbeConfig],
     pins: &mut PinTable,
     engines: &mut Vec<DynEngine, MAX_PROBES>,
@@ -93,24 +93,33 @@ fn block_engines<P: Instance + Send>(
         &'static StaticCell<SwdEngine<'static, P, 3>>,
     ),
 ) {
-    let program = SwdProgram::load(&mut pio.common);
+    let Pio { mut common, sm0, sm1, sm2, sm3, .. } = pio;
+    let program = SwdProgram::load(&mut common);
 
+    // Dropping PIO handles decrements the block's user refcount, and when it
+    // hits 1 embassy resets the funcsel of EVERY pin the block ever claimed
+    // (`on_pio_drop`) — disconnecting live probes. Engines keep their own SM
+    // alive in a StaticCell; unused SMs and the Common must never be dropped.
     macro_rules! slot {
         ($k:literal, $sm:expr, $cell:expr) => {
             if let Some(cfg) = probes.get($k) {
-                let swclk = pins.claim_pio(&mut pio.common, cfg.swclk);
-                let swdio = pins.claim_pio(&mut pio.common, cfg.swdio);
+                let swclk = pins.claim_pio(&mut common, cfg.swclk);
+                let swdio = pins.claim_pio(&mut common, cfg.swdio);
                 let nreset = cfg.reset.map(|n| pins.claim_gpio(n));
                 let engine = SwdEngine::new(&program, $sm, swclk, swdio, nreset);
                 engines.push($cell.init(engine)).ok().expect("MAX_PROBES");
+            } else {
+                core::mem::forget($sm);
             }
         };
     }
 
-    slot!(0, pio.sm0, cells.0);
-    slot!(1, pio.sm1, cells.1);
-    slot!(2, pio.sm2, cells.2);
-    slot!(3, pio.sm3, cells.3);
+    slot!(0, sm0, cells.0);
+    slot!(1, sm1, cells.1);
+    slot!(2, sm2, cells.2);
+    slot!(3, sm3, cells.3);
+
+    core::mem::forget(common);
 }
 
 macro_rules! block_cells {

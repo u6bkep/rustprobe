@@ -10,7 +10,7 @@ use embassy_time::Timer;
 use probe_config::protocol::*;
 use probe_config::{BoardProfile, ChipLimits, Topology};
 
-use crate::flash_config::{store_topology, ProbeFlash};
+use crate::flash_config::commit_topology;
 
 /// Max payload bytes per GET_TOPOLOGY response chunk
 /// (64-byte packet minus cmd, status, total_len).
@@ -23,7 +23,6 @@ struct Staged {
 
 /// Shared state behind the config protocol.
 pub struct ConfigService {
-    flash: Mutex<CriticalSectionRawMutex, ProbeFlash>,
     staged: Mutex<CriticalSectionRawMutex, Staged>,
     watchdog: Mutex<CriticalSectionRawMutex, Watchdog>,
     info: FirmwareInfo,
@@ -40,7 +39,6 @@ pub enum AfterResponse {
 
 impl ConfigService {
     pub fn new(
-        flash: ProbeFlash,
         watchdog: Watchdog,
         info: FirmwareInfo,
         active: Topology,
@@ -48,7 +46,6 @@ impl ConfigService {
         profile: BoardProfile,
     ) -> Self {
         Self {
-            flash: Mutex::new(flash),
             staged: Mutex::new(Staged { buf: [0; TOPOLOGY_BUF_LEN], filled: 0 }),
             watchdog: Mutex::new(watchdog),
             info,
@@ -150,8 +147,7 @@ impl ConfigService {
             response[1] = STATUS_ERR_INVALID;
             return 2;
         }
-        let mut flash = self.flash.lock().await;
-        if store_topology(&mut flash, &topo).await.is_err() {
+        if commit_topology(topo).await.is_err() {
             response[1] = STATUS_ERR_FLASH;
         }
         2

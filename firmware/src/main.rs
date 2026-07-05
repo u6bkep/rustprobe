@@ -121,15 +121,22 @@ fn unique_id(flash: &mut embassy_rp::flash::Flash<'static, embassy_rp::periphera
 }
 
 /// `"<uid hex>:<instance>"`, the serial scheme of the C multiprobe firmware.
-fn format_serial(buf: &mut [u8; 19], uid: u64, instance: usize) -> &str {
+/// Instance is decimal (up to two digits — MAX_PROBES is 12).
+fn format_serial(buf: &mut [u8; 20], uid: u64, instance: usize) -> &str {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for i in 0..16 {
         buf[i] = HEX[((uid >> (60 - 4 * i)) & 0xf) as usize];
     }
     buf[16] = b':';
-    buf[17] = b'0' + instance as u8;
-    buf[18] = 0;
-    core::str::from_utf8(&buf[..18]).unwrap()
+    let len = if instance >= 10 {
+        buf[17] = b'0' + (instance / 10) as u8;
+        buf[18] = b'0' + (instance % 10) as u8;
+        19
+    } else {
+        buf[17] = b'0' + instance as u8;
+        18
+    };
+    core::str::from_utf8(&buf[..len]).unwrap()
 }
 
 static CORE1_STACK: StaticCell<Stack<8192>> = StaticCell::new();
@@ -165,8 +172,8 @@ async fn main(spawner: Spawner) {
     );
 
     // --- Serial strings ----------------------------------------------------
-    static SERIAL_BUFS: StaticCell<[[u8; 19]; MAX_PROBES]> = StaticCell::new();
-    let serial_bufs = SERIAL_BUFS.init([[0; 19]; MAX_PROBES]);
+    static SERIAL_BUFS: StaticCell<[[u8; 20]; MAX_PROBES]> = StaticCell::new();
+    let serial_bufs = SERIAL_BUFS.init([[0; 20]; MAX_PROBES]);
     let mut serials: Vec<&'static str, MAX_PROBES> = Vec::new();
     for (i, buf) in serial_bufs.iter_mut().enumerate() {
         serials.push(format_serial(buf, uid, i)).unwrap();
@@ -199,14 +206,15 @@ async fn main(spawner: Spawner) {
 
     static CONFIG_DESC: StaticCell<[u8; 1024]> = StaticCell::new();
     static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
-    static MSOS_DESC: StaticCell<[u8; 2048]> = StaticCell::new();
+    // ~170 B per WinUSB function subset × 12 probes, plus headers.
+    static MSOS_DESC: StaticCell<[u8; 3072]> = StaticCell::new();
     static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
     let mut builder = Builder::new(
         driver,
         config,
         CONFIG_DESC.init([0; 1024]),
         BOS_DESC.init([0; 256]),
-        MSOS_DESC.init([0; 2048]),
+        MSOS_DESC.init([0; 3072]),
         CONTROL_BUF.init([0; 64]),
     );
 
@@ -249,13 +257,14 @@ async fn main(spawner: Spawner) {
     };
     static SERVICE: StaticCell<ConfigService> = StaticCell::new();
     let service: &'static ConfigService = SERVICE.init(ConfigService::new(
-        flash,
         Watchdog::new(p.WATCHDOG),
         info,
         topology.clone(),
         LIMITS,
         profile,
     ));
+    // Flash ops must run on core 0; the worker owns the flash from here on.
+    spawner.spawn(flash_config::flash_worker(flash).unwrap());
 
     // --- DAP handlers, executed on core 1 ----------------------------------
     let mut daps: Vec<(DapHandler, Endpoint<'static, USB, Out>, Endpoint<'static, USB, In>, &'static str), MAX_PROBES> =
