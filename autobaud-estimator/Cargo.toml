@@ -1,0 +1,11 @@
+[package]
+name = "autobaud-estimator"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Pure no_std UART baud-rate estimator from PIO edge-timing samples (shared by firmware and host tests)"
+
+[dependencies]
+# `libm` gives us `expf`/`roundf` on `no_std` targets and, uniformly, on the
+# host test build — so the algorithm is byte-for-byte the same in both.
+libm = "0.2"

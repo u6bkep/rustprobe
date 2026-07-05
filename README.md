@@ -9,6 +9,7 @@ instead of at compile time.
 | Crate | Purpose |
 |---|---|
 | `probe-config` | `no_std` config schema + validation, shared by firmware and host tools |
+| `autobaud-estimator` | `no_std` baud-rate estimator core (raw edge-timing samples in, baud out), host-testable |
 | `firmware` | embassy-based probe firmware (features: `rp2040` \| `rp2350`) |
 | `cli` | `rustprobe` host CLI: configure the probe over USB (nusb + `probe-config`) |
 
@@ -26,8 +27,8 @@ cargo build -p rustprobe-firmware --target thumbv6m-none-eabi --release
 cargo build -p rustprobe-firmware --target thumbv8m.main-none-eabihf \
     --no-default-features --features rp2350 --release
 
-# Host-side tests
-cargo test -p probe-config
+# Host-side tests (config validation + autobaud estimator)
+cargo test --workspace --exclude rustprobe-firmware
 ```
 
 `cargo run` flashes via probe-rs (see `.cargo/config.toml` runners); defmt
@@ -89,7 +90,17 @@ bridging as the C firmware does. Pin/instance legality is enforced by
 {4,8,20,24}, RX = the matching bank), so the bridge code assumes a valid
 topology.
 
-Not yet: autobaud (the `MAGIC_BAUD` 9728 line-coding trigger is stubbed with a
-`TODO(autobaud)` hook), host-driven UART break (embassy's `CdcAcmClass`
-doesn't surface CDC `SEND_BREAK` — `TODO(break)`), RP2350-only alternate UART
-pins, LEDs.
+Autobaud (ports `debugprobe/src/autobaud.{pio,c}`): selecting the magic baud
+rate (9728) on a CDC port triggers a PIO edge timer that measures the target's
+low-pulse widths; a DMA channel streams the timer FIFO into the
+`autobaud-estimator` core (hash-binned pulse-width clustering → baud + validity
+score), and a confident estimate is applied to the UART with `set_baudrate`.
+The estimator is a pure `no_std` crate with host unit tests (synthetic 8N1
+edge-timing samples across several bauds, asserting the estimate lands within
+0.5%). The capture state machine is the SM `validate` already reserves when a
+UART is configured (the next free SM after the probes); it snoops the UART's RX
+GPIO via PIO input without disturbing the UART's ownership of the pin. See
+`firmware/src/autobaud.rs`.
+
+Not yet: host-driven UART break (embassy's `CdcAcmClass` doesn't surface CDC
+`SEND_BREAK` — `TODO(break)`), RP2350-only alternate UART pins, LEDs.

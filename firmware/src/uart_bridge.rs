@@ -25,13 +25,15 @@
 //!   when it reasserts.
 
 use defmt::info;
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select4, Either4};
 use embassy_rp::peripherals::USB;
 use embassy_rp::uart::{self, BufferedUart};
 use embassy_rp::usb::Driver;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, LineCoding, ParityType, StopBits};
 use embedded_io_async::{Read as _, Write as _};
 use probe_config::MAX_UARTS;
+
+use crate::autobaud;
 
 /// Static RX/TX ring-buffer size for each `BufferedUart`, in bytes. The C
 /// firmware works one 32-byte PL011 FIFO at a time; 256 bytes of interrupt
@@ -79,15 +81,23 @@ pub fn apply_line_coding(base: uart::Config, coding: &LineCoding) -> uart::Confi
 
 /// Bridge one CDC-ACM port to one hardware UART until reboot.
 ///
+/// `uart_id` is this bridge's index (0-based, in topology order); `rx_pin` is
+/// the UART RX GPIO, snooped by the autobaud engine when the host selects
+/// [`MAGIC_BAUD`].
+///
 /// Single-task, select-driven copy: only one endpoint borrows each half inside
 /// the `select`, and the follow-up write happens after the losing futures are
 /// dropped, so no half is aliased. Dropping a partially-progressed
 /// `read`/`read_packet` future is safe — both read from interrupt-fed buffers.
 #[embassy_executor::task(pool_size = MAX_UARTS)]
-pub async fn uart_bridge(mut uart: BufferedUart, class: CdcClass) -> ! {
+pub async fn uart_bridge(mut uart: BufferedUart, class: CdcClass, uart_id: u8, rx_pin: u8) -> ! {
     let (mut usb_tx, mut usb_rx, control) = class.split_with_control();
     let mut usb_buf = [0u8; CDC_PACKET_SIZE as usize];
     let mut uart_buf = [0u8; CDC_PACKET_SIZE as usize];
+    // One autobaud result receiver per bridge (the `Watch` has `MAX_UARTS`).
+    let mut ab_rx = autobaud::result_receiver().expect("autobaud result receiver");
+    // Whether this bridge currently has an autobaud session running.
+    let mut autobauding = false;
 
     loop {
         usb_rx.wait_connection().await;
@@ -102,15 +112,16 @@ pub async fn uart_bridge(mut uart: BufferedUart, class: CdcClass) -> ! {
                 continue;
             }
 
-            match select3(
+            match select4(
                 usb_rx.read_packet(&mut usb_buf),
                 uart.read(&mut uart_buf),
                 control.control_changed(),
+                ab_rx.changed(),
             )
             .await
             {
                 // Host → target.
-                Either3::First(res) => match res {
+                Either4::First(res) => match res {
                     Ok(n) => {
                         if uart.write_all(&usb_buf[..n]).await.is_err() {
                             break 'connected;
@@ -120,7 +131,7 @@ pub async fn uart_bridge(mut uart: BufferedUart, class: CdcClass) -> ! {
                 },
                 // Target → host. A UART error (framing/overrun/parity/break)
                 // just drops the affected bytes, as the C firmware does.
-                Either3::Second(res) => {
+                Either4::Second(res) => {
                     if let Ok(n) = res {
                         if usb_tx.write_packet(&uart_buf[..n]).await.is_err() {
                             break 'connected;
@@ -128,13 +139,20 @@ pub async fn uart_bridge(mut uart: BufferedUart, class: CdcClass) -> ! {
                     }
                 }
                 // Line-coding / control-line change.
-                Either3::Third(()) => {
+                Either4::Third(()) => {
                     let coding = control.line_coding();
                     if coding.data_rate() == MAGIC_BAUD {
-                        // TODO(autobaud): a later task starts the PIO autobaud
-                        // estimator here (see debugprobe `autobaud.c`) instead of
-                        // applying 9728 as a literal line rate.
+                        // Ask the PIO autobaud engine to measure this UART's
+                        // target baud (ports `autobaud_start` in cdc_uart.c),
+                        // instead of applying 9728 as a literal line rate.
+                        autobaud::start(uart_id, rx_pin);
+                        autobauding = true;
                     } else {
+                        // Any real line coding cancels an in-progress autobaud.
+                        if autobauding {
+                            autobaud::stop();
+                            autobauding = false;
+                        }
                         // embassy-rp `BufferedUart` exposes `set_baudrate` but no
                         // `set_format`, so only baud is applied live. The
                         // data-bit/parity/stop-bit fields of `cfg` would need a
@@ -146,6 +164,18 @@ pub async fn uart_bridge(mut uart: BufferedUart, class: CdcClass) -> ! {
                     // TODO(break): embassy's `CdcAcmClass` does not surface the
                     // CDC SEND_BREAK request, so `tud_cdc_send_break_cb`'s
                     // behaviour (timed/steady `uart_set_break`) is unavailable.
+                }
+                // Autobaud published a new estimate. Apply it if it is for this
+                // bridge and a session is active (ports `baudQueue` +
+                // `cdc_uart_set_baudrate`).
+                Either4::Fourth(result) => {
+                    if autobauding && result.uart == uart_id {
+                        info!(
+                            "uart bridge {}: autobaud -> {} baud (validity {})",
+                            uart_id, result.baud, result.validity
+                        );
+                        uart.set_baudrate(result.baud);
+                    }
                 }
             }
         }

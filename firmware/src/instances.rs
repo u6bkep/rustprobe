@@ -19,6 +19,7 @@ use heapless::Vec;
 use probe_config::{ProbeConfig, Topology, MAX_PROBES};
 use static_cell::StaticCell;
 
+use crate::autobaud::{AutobaudCapture, AutobaudSm};
 use crate::swd::{SwdBus, SwdEngine, SwdProgram};
 use crate::Irqs;
 
@@ -170,7 +171,13 @@ pub struct PioBlocks {
     pub pio2: Peri<'static, embassy_rp::peripherals::PIO2>,
 }
 
-/// Create one engine per (block, sm) slot used by `topo`, in probe order.
+/// Create one engine per (block, sm) slot used by `probes`, in probe order.
+///
+/// When `reserve_sm3` is set, SM3 is handed to autobaud instead of being
+/// forgotten: the autobaud program is loaded into this block's `Common` and the
+/// prepared capture is returned. `reserve_sm3` is only set for a block that has
+/// fewer than four probes (so SM3 carries no probe), and only when a UART is
+/// configured — see [`build_engines`].
 fn block_engines<P: Instance + Send>(
     pio: Pio<'static, P>,
     probes: &[ProbeConfig],
@@ -182,7 +189,8 @@ fn block_engines<P: Instance + Send>(
         &'static StaticCell<SwdEngine<'static, P, 2>>,
         &'static StaticCell<SwdEngine<'static, P, 3>>,
     ),
-) {
+    reserve_sm3: bool,
+) -> Option<AutobaudCapture<'static, P, 3>> {
     let Pio { mut common, sm0, sm1, sm2, sm3, .. } = pio;
     let program = SwdProgram::load(&mut common);
 
@@ -207,9 +215,34 @@ fn block_engines<P: Instance + Send>(
     slot!(0, sm0, cells.0);
     slot!(1, sm1, cells.1);
     slot!(2, sm2, cells.2);
-    slot!(3, sm3, cells.3);
+
+    let autobaud = if reserve_sm3 {
+        // Autobaud shares this block: load its program into the same Common and
+        // keep SM3. `common` is forgotten below, so the loaded program (and the
+        // block's funcsel state) survive for the firmware's life.
+        Some(AutobaudCapture::new(&mut common, sm3))
+    } else {
+        slot!(3, sm3, cells.3);
+        None
+    };
 
     core::mem::forget(common);
+    autobaud
+}
+
+/// Claim a probe-free PIO block solely for autobaud (SM0). The block's other
+/// SMs and its `Common` are forgotten; the block claims no pins (autobaud reads
+/// the raw RX input), so nothing is disconnected by forgetting them.
+fn fresh_autobaud_block<P: Instance + Send>(
+    pio: Pio<'static, P>,
+) -> AutobaudCapture<'static, P, 0> {
+    let Pio { mut common, sm0, sm1, sm2, sm3, .. } = pio;
+    let cap = AutobaudCapture::new(&mut common, sm0);
+    core::mem::forget(sm1);
+    core::mem::forget(sm2);
+    core::mem::forget(sm3);
+    core::mem::forget(common);
+    cap
 }
 
 macro_rules! block_cells {
@@ -222,43 +255,81 @@ macro_rules! block_cells {
     }};
 }
 
-/// Instantiate the SWD engines for a validated topology.
+/// Instantiate the SWD engines for a validated topology, plus the autobaud
+/// capture SM when at least one UART is configured.
+///
+/// Probes fill slots from PIO0/SM0 upward (probe N → block N/4, SM N%4). The
+/// SM `probe_config`'s validation reserves for autobaud is the next free slot,
+/// which is therefore either SM3 of the last partially-filled block (when the
+/// probe count isn't a multiple of four) or SM0 of the next, otherwise-unused
+/// block. Only those two SM indices are ever used, keeping [`AutobaudSm`] small.
 pub fn build_engines(
     topo: &Topology,
     blocks: PioBlocks,
     pins: &mut PinTable,
-) -> Vec<DynEngine, MAX_PROBES> {
+) -> (Vec<DynEngine, MAX_PROBES>, Option<AutobaudSm>) {
     let mut engines: Vec<DynEngine, MAX_PROBES> = Vec::new();
     let probes = topo.probes.as_slice();
+    let n = probes.len();
+    let has_uart = !topo.uarts.is_empty();
 
+    // Which block the reserved autobaud SM lives in, and whether it shares a
+    // partially-filled block (SM3) or claims a fresh one (SM0).
+    let ab_block = has_uart.then_some(n / 4);
+    let shares = |block: usize| ab_block == Some(block) && n % 4 != 0;
+    let fresh = |block: usize| ab_block == Some(block) && n % 4 == 0;
+
+    let mut autobaud: Option<AutobaudSm> = None;
+
+    // Block 0 (PIO0).
     if !probes.is_empty() {
-        block_engines(
+        let cap = block_engines(
             Pio::new(blocks.pio0, Irqs),
-            &probes[..probes.len().min(4)],
+            &probes[..n.min(4)],
             pins,
             &mut engines,
             block_cells!(embassy_rp::peripherals::PIO0),
+            shares(0),
         );
+        autobaud = cap.map(AutobaudSm::P0S3);
+    } else if fresh(0) {
+        autobaud = Some(AutobaudSm::P0S0(fresh_autobaud_block(Pio::new(blocks.pio0, Irqs))));
     }
-    if probes.len() > 4 {
-        block_engines(
+
+    // Block 1 (PIO1).
+    if n > 4 {
+        let cap = block_engines(
             Pio::new(blocks.pio1, Irqs),
-            &probes[4..probes.len().min(8)],
+            &probes[4..n.min(8)],
             pins,
             &mut engines,
             block_cells!(embassy_rp::peripherals::PIO1),
+            shares(1),
         );
+        if let Some(c) = cap {
+            autobaud = Some(AutobaudSm::P1S3(c));
+        }
+    } else if fresh(1) {
+        autobaud = Some(AutobaudSm::P1S0(fresh_autobaud_block(Pio::new(blocks.pio1, Irqs))));
     }
+
+    // Block 2 (PIO2, RP2350 only).
     #[cfg(feature = "rp2350")]
-    if probes.len() > 8 {
-        block_engines(
+    if n > 8 {
+        let cap = block_engines(
             Pio::new(blocks.pio2, crate::IrqsPio2),
-            &probes[8..probes.len().min(12)],
+            &probes[8..n.min(12)],
             pins,
             &mut engines,
             block_cells!(embassy_rp::peripherals::PIO2),
+            shares(2),
         );
+        if let Some(c) = cap {
+            autobaud = Some(AutobaudSm::P2S3(c));
+        }
+    } else if fresh(2) {
+        autobaud = Some(AutobaudSm::P2S0(fresh_autobaud_block(Pio::new(blocks.pio2, crate::IrqsPio2))));
     }
 
-    engines
+    (engines, autobaud)
 }

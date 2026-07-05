@@ -12,6 +12,7 @@ rp2350 = ["embassy-rp/rp235xa"]
 
 [dependencies]
 probe-config = { path = "../probe-config" }
+autobaud-estimator = { path = "../autobaud-estimator" }
 
 # Embassy from the computer-whisperer fork: carries fixes not yet upstreamed,
 # notably the PIO GPIOBASE window-selection fix needed on RP2350B, the RP2350

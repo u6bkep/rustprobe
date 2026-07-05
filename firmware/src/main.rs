@@ -8,6 +8,7 @@
 #![no_std]
 #![no_main]
 
+mod autobaud;
 mod dap;
 mod flash_config;
 mod instances;
@@ -47,6 +48,7 @@ bind_interrupts!(pub struct Irqs {
     PIO1_IRQ_0 => pio::InterruptHandler<embassy_rp::peripherals::PIO1>;
     UART0_IRQ => embassy_rp::uart::BufferedInterruptHandler<embassy_rp::peripherals::UART0>;
     UART1_IRQ => embassy_rp::uart::BufferedInterruptHandler<embassy_rp::peripherals::UART1>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
 });
 
 #[cfg(feature = "rp2350")]
@@ -203,7 +205,7 @@ async fn main(spawner: Spawner) {
         #[cfg(feature = "rp2350")]
         pio2: p.PIO2,
     };
-    let engines = build_engines(&topology, blocks, &mut pins);
+    let (engines, autobaud_sm) = build_engines(&topology, blocks, &mut pins);
 
     // --- USB device ---------------------------------------------------------
     let driver = Driver::new(p.USB, Irqs);
@@ -329,12 +331,13 @@ async fn main(spawner: Spawner) {
 
     let mut uart0 = Some(p.UART0);
     let mut uart1 = Some(p.UART1);
-    for (((ucfg, cdc), tx_buf), rx_buf) in topology
+    for (i, (((ucfg, cdc), tx_buf), rx_buf)) in topology
         .uarts
         .iter()
         .zip(cdc_classes)
         .zip(tx_bufs.iter_mut())
         .zip(rx_bufs.iter_mut())
+        .enumerate()
     {
         let mut cfg = uart::Config::default();
         cfg.baudrate = ucfg.baud;
@@ -343,7 +346,15 @@ async fn main(spawner: Spawner) {
             1 => pins.claim_uart1(uart1.take().expect("UART1 free"), cfg, ucfg.tx, ucfg.rx, tx_buf, rx_buf),
             _ => unreachable!("validated: UART instance is 0 or 1"),
         };
-        spawner.spawn(uart_bridge::uart_bridge(bridge_uart, cdc).unwrap());
+        spawner.spawn(uart_bridge::uart_bridge(bridge_uart, cdc, i as u8, ucfg.rx).unwrap());
+    }
+
+    // Autobaud capture task (core 0). Present only when a UART is configured;
+    // `build_engines` reserves its state machine. One dedicated DMA channel
+    // streams the PIO edge-timer FIFO into the estimator.
+    if let Some(autobaud_sm) = autobaud_sm {
+        let dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
+        spawner.spawn(autobaud::autobaud_task(autobaud_sm, dma).unwrap());
     }
 
     spawner.spawn(usb_task(usb).unwrap());
