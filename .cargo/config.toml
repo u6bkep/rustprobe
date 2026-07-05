@@ -1,0 +1,15 @@
+# Build the firmware with:
+#   RP2040:  cargo build -p rustprobe-firmware --target thumbv6m-none-eabi
+#   RP2350:  cargo build -p rustprobe-firmware --target thumbv8m.main-none-eabihf \
+#              --no-default-features --features rp2350
+#
+# Linker scripts are injected by firmware/build.rs (feature-dependent).
+
+[target.thumbv6m-none-eabi]
+runner = "probe-rs run --chip RP2040"
+
+[target."thumbv8m.main-none-eabihf"]
+runner = "probe-rs run --chip RP235x"
+
+[env]
+DEFMT_LOG = "info"

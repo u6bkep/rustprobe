@@ -1,0 +1,13 @@
+[package]
+name = "probe-config"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Shared configuration schema and validation for the rustprobe firmware and host tools"
+
+[dependencies]
+heapless = { version = "0.8", default-features = false, features = ["serde"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+
+[features]
+default = []

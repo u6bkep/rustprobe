@@ -1,0 +1,41 @@
+[package]
+name = "rustprobe-firmware"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["rp2040"]
+rp2040 = ["embassy-rp/rp2040"]
+# Pico 2 (RP2350A). For RP2350B boards use this feature too and adjust pins.
+rp2350 = ["embassy-rp/rp235xa"]
+
+[dependencies]
+probe-config = { path = "../probe-config" }
+
+# Embassy from the computer-whisperer fork: carries fixes not yet upstreamed,
+# notably the PIO GPIOBASE window-selection fix needed on RP2350B, the RP2350
+# flash driver QMI save/restore, and a PIO/DMA TOCTOU fix.
+embassy-executor = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6", features = ["defmt"] }
+embassy-rp = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "binary-info"] }
+embassy-usb = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6", features = ["defmt"] }
+embassy-sync = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6", features = ["defmt"] }
+embassy-futures = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6" }
+
+# CMSIS-DAP protocol engine (probe-rs project). Pinned; we implement its
+# Swd/Dependencies traits over the PIO engine.
+dap-rs = { git = "https://github.com/probe-rs/dap-rs", rev = "a867ca7" }
+
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+static_cell = "2"
+# thumbv6m has no atomic CAS; route portable-atomic through critical-section
+# (impl provided by embassy-rp), which stays correct across both cores.
+portable-atomic = { version = "1", features = ["critical-section"] }
+heapless = { version = "0.8", default-features = false }
+fixed = "1"
+embedded-hal = "1"
