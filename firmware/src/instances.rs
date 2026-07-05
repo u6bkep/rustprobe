@@ -13,6 +13,7 @@
 
 use embassy_rp::gpio::AnyPin;
 use embassy_rp::pio::{Common, Instance, Pin as PioPinHandle, Pio};
+use embassy_rp::uart::{self, BufferedUart};
 use embassy_rp::Peri;
 use heapless::Vec;
 use probe_config::{ProbeConfig, Topology, MAX_PROBES};
@@ -71,6 +72,95 @@ pin_table! {
     p24: PIN_24 => 24, p25: PIN_25 => 25, p26: PIN_26 => 26, p27: PIN_27 => 27,
     p28: PIN_28 => 28, p29: PIN_29 => 29,
 }
+
+/// Generate `PinTable::claim_uart{0,1}`, the UART analogue of `claim_pio`.
+///
+/// `BufferedUart::new` needs pin *values whose types* implement
+/// `TxPin<UARTx>`/`RxPin<UARTx>`, so — as with [`PinTable::claim_pio`] — we
+/// match the runtime pin numbers against the compile-time-legal pins and build
+/// the driver inside the matching arm. TX and RX mux independently, so the arms
+/// enumerate the `(tx, rx)` cross product for the instance (given flat, since
+/// both pin lists are captured at the same macro depth and can't be nested).
+///
+/// Only the pin set common to RP2040 and RP2350 is handled; a validated
+/// topology (`UartConfig::instance`) never presents anything else, so the `_`
+/// arm is unreachable in practice. See `probe_config::UartConfig::instance` for
+/// the RP2350-only alternate pins not yet supported here.
+macro_rules! uart_claimer {
+    (
+        $fn:ident, $inst:ident,
+        [ $( ($tx:literal, $txf:ident, $rx:literal, $rxf:ident) ),* $(,)? ] $(,)?
+    ) => {
+        impl PinTable {
+            /// Claim a hardware UART's TX/RX pins and build its `BufferedUart`.
+            /// Panics on an already-claimed pin or an illegal pin pair
+            /// (validation prevents both).
+            pub fn $fn(
+                &mut self,
+                uart: Peri<'static, embassy_rp::peripherals::$inst>,
+                config: uart::Config,
+                tx_pin: u8,
+                rx_pin: u8,
+                tx_buf: &'static mut [u8],
+                rx_buf: &'static mut [u8],
+            ) -> BufferedUart {
+                match (tx_pin, rx_pin) {
+                    $(
+                        ($tx, $rx) => {
+                            let tx = self.$txf.take().expect("uart tx pin already claimed");
+                            let rx = self.$rxf.take().expect("uart rx pin already claimed");
+                            BufferedUart::new(uart, tx, rx, crate::Irqs, tx_buf, rx_buf, config)
+                        }
+                    )*
+                    _ => panic!("illegal uart pin pair (validation should prevent this)"),
+                }
+            }
+        }
+    };
+}
+
+uart_claimer!(
+    claim_uart0, UART0,
+    [
+        (0, p0, 1, p1),
+        (0, p0, 13, p13),
+        (0, p0, 17, p17),
+        (0, p0, 29, p29),
+        (12, p12, 1, p1),
+        (12, p12, 13, p13),
+        (12, p12, 17, p17),
+        (12, p12, 29, p29),
+        (16, p16, 1, p1),
+        (16, p16, 13, p13),
+        (16, p16, 17, p17),
+        (16, p16, 29, p29),
+        (28, p28, 1, p1),
+        (28, p28, 13, p13),
+        (28, p28, 17, p17),
+        (28, p28, 29, p29),
+    ],
+);
+uart_claimer!(
+    claim_uart1, UART1,
+    [
+        (4, p4, 5, p5),
+        (4, p4, 9, p9),
+        (4, p4, 21, p21),
+        (4, p4, 25, p25),
+        (8, p8, 5, p5),
+        (8, p8, 9, p9),
+        (8, p8, 21, p21),
+        (8, p8, 25, p25),
+        (20, p20, 5, p5),
+        (20, p20, 9, p9),
+        (20, p20, 21, p21),
+        (20, p20, 25, p25),
+        (24, p24, 5, p5),
+        (24, p24, 9, p9),
+        (24, p24, 21, p21),
+        (24, p24, 25, p25),
+    ],
+);
 
 /// PIO peripherals handed to `build_engines`.
 pub struct PioBlocks {

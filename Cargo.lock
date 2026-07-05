@@ -1300,6 +1300,7 @@ dependencies = [
  "embassy-time",
  "embassy-usb",
  "embedded-hal 1.0.0",
+ "embedded-io-async",
  "fixed",
  "heapless 0.8.0",
  "panic-probe",
