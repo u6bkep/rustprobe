@@ -12,6 +12,7 @@ mod dap;
 mod flash_config;
 mod instances;
 mod swd;
+mod uart_bridge;
 mod vendor;
 
 use defmt::{info, warn};
@@ -19,28 +20,33 @@ use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::USB;
+use embassy_rp::uart;
 use embassy_rp::usb::{Driver, Endpoint, In, InterruptHandler, Out};
 use embassy_rp::watchdog::Watchdog;
 use embassy_rp::{bind_interrupts, pio};
+use embassy_usb::class::cdc_acm;
 use embassy_usb::driver::{Endpoint as _, EndpointIn, EndpointOut};
 use embassy_usb::msos::{self, windows_version};
 use embassy_usb::types::StringIndex;
 use embassy_usb::{Builder, Config, Handler, UsbDevice};
 use heapless::Vec;
 use probe_config::protocol::{Chip, FirmwareInfo, PROTOCOL_VERSION, VENDOR_BASE, VENDOR_END};
-use probe_config::{BoardProfile, ChipLimits, ProbeConfig, Topology, MAX_PROBES};
+use probe_config::{BoardProfile, ChipLimits, ProbeConfig, Topology, MAX_PROBES, MAX_UARTS};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 use crate::dap::{NoLeds, ProbeContext, ProbeJtag, ProbeSwd};
 use crate::flash_config::{load_topology, ProbeFlash, FLASH_SIZE};
 use crate::instances::{build_engines, PinTable, PioBlocks};
+use crate::uart_bridge::CdcClass;
 use crate::vendor::{AfterResponse, ConfigService};
 
 bind_interrupts!(pub struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
     PIO0_IRQ_0 => pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
     PIO1_IRQ_0 => pio::InterruptHandler<embassy_rp::peripherals::PIO1>;
+    UART0_IRQ => embassy_rp::uart::BufferedInterruptHandler<embassy_rp::peripherals::UART0>;
+    UART1_IRQ => embassy_rp::uart::BufferedInterruptHandler<embassy_rp::peripherals::UART1>;
 });
 
 #[cfg(feature = "rp2350")]
@@ -67,11 +73,16 @@ const CHIP: Chip = Chip::Rp2350;
 const LIMITS: ChipLimits = probe_config::RP2350A;
 
 /// Fallback when no valid topology is stored: the stock debugprobe-on-pico
-/// probe (SWCLK=GP2, SWDIO=GP3, nRESET=GP1).
+/// probe (SWCLK=GP2, SWDIO=GP3, nRESET=GP1) plus its CDC-UART bridge
+/// (TX=GP4, RX=GP5 on UART1 @ 115200), matching the C firmware's stock pico
+/// config.
 fn default_topology() -> Topology {
     let mut t = Topology::default();
     t.probes
         .push(ProbeConfig { swclk: 2, swdio: 3, reset: Some(1) })
+        .unwrap();
+    t.uarts
+        .push(probe_config::UartConfig { tx: 4, rx: 5, baud: 115200 })
         .unwrap();
     t
 }
@@ -232,6 +243,24 @@ async fn main(spawner: Spawner) {
         endpoints.push((out_ep, in_ep)).ok().unwrap();
     }
 
+    // One CDC-ACM function per configured UART, added *after* the DAP
+    // interfaces so DAP interface numbers stay 0..N-1. Each consumes a static
+    // `State` (control-transfer scratch); the data copy uses static ring
+    // buffers allocated below.
+    static CDC_STATES: StaticCell<[cdc_acm::State<'static>; MAX_UARTS]> = StaticCell::new();
+    let cdc_states = CDC_STATES.init([const { cdc_acm::State::new() }; MAX_UARTS]);
+    let mut cdc_classes: Vec<CdcClass, MAX_UARTS> = Vec::new();
+    for state in cdc_states.iter_mut().take(topology.uarts.len()) {
+        cdc_classes
+            .push(cdc_acm::CdcAcmClass::new(
+                &mut builder,
+                state,
+                uart_bridge::CDC_PACKET_SIZE,
+            ))
+            .ok()
+            .expect("MAX_UARTS");
+    }
+
     static STRINGS: StaticCell<InterfaceStrings> = StaticCell::new();
     builder.handler(STRINGS.init(InterfaceStrings { dap_str }));
 
@@ -280,6 +309,33 @@ async fn main(spawner: Spawner) {
             }
         })
     });
+
+    // --- CDC-UART bridges, executed on core 0 (this executor) --------------
+    // Each bridge pairs the CDC class built above (in UART order) with a
+    // `BufferedUart` claimed on the instance the validated config selects.
+    static UART_TX_BUFS: StaticCell<[[u8; uart_bridge::UART_BUF_SIZE]; MAX_UARTS]> = StaticCell::new();
+    static UART_RX_BUFS: StaticCell<[[u8; uart_bridge::UART_BUF_SIZE]; MAX_UARTS]> = StaticCell::new();
+    let tx_bufs = UART_TX_BUFS.init([[0; uart_bridge::UART_BUF_SIZE]; MAX_UARTS]);
+    let rx_bufs = UART_RX_BUFS.init([[0; uart_bridge::UART_BUF_SIZE]; MAX_UARTS]);
+
+    let mut uart0 = Some(p.UART0);
+    let mut uart1 = Some(p.UART1);
+    for (((ucfg, cdc), tx_buf), rx_buf) in topology
+        .uarts
+        .iter()
+        .zip(cdc_classes)
+        .zip(tx_bufs.iter_mut())
+        .zip(rx_bufs.iter_mut())
+    {
+        let mut cfg = uart::Config::default();
+        cfg.baudrate = ucfg.baud;
+        let bridge_uart = match ucfg.instance().expect("validated topology") {
+            0 => pins.claim_uart0(uart0.take().expect("UART0 free"), cfg, ucfg.tx, ucfg.rx, tx_buf, rx_buf),
+            1 => pins.claim_uart1(uart1.take().expect("UART1 free"), cfg, ucfg.tx, ucfg.rx, tx_buf, rx_buf),
+            _ => unreachable!("validated: UART instance is 0 or 1"),
+        };
+        spawner.spawn(uart_bridge::uart_bridge(bridge_uart, cdc).unwrap());
+    }
 
     spawner.spawn(usb_task(usb).unwrap());
 }

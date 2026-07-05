@@ -40,5 +40,6 @@ portable-atomic = { version = "1", features = ["critical-section"] }
 heapless = { version = "0.8", default-features = false }
 fixed = "1"
 embedded-hal = "1"
+embedded-io-async = "0.7"
 postcard = { version = "1", default-features = false }
 sequential-storage = "4"

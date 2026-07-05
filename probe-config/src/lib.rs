@@ -48,6 +48,50 @@ pub struct UartConfig {
     pub baud: u32,
 }
 
+impl UartConfig {
+    /// Which hardware UART instance (0 or 1) this bridge's pins select, or
+    /// `None` if `tx` and `rx` are not both valid pins for the *same* instance.
+    ///
+    /// The RP2040/RP2350 pin mux ties each GPIO to at most one UART function.
+    /// This uses the pin set common to both chips (verified against embassy-rp's
+    /// `TxPin`/`RxPin` trait impls in `embassy-rp/src/uart/mod.rs`):
+    ///
+    /// | UART | TX pins        | RX pins        |
+    /// |------|----------------|----------------|
+    /// | 0    | 0, 12, 16, 28  | 1, 13, 17, 29  |
+    /// | 1    | 4, 8, 20, 24   | 5, 9, 21, 25   |
+    ///
+    /// RP2350 exposes additional alternate UART pins (GP2/3, GP6/7, GP10/11,
+    /// GP14/15, GP18/19, GP22/23, GP26/27); those are not accepted yet, so the
+    /// firmware's pin-claiming match only needs the common set. Extending both
+    /// this table and `PinTable::claim_uart{0,1}` is a coordinated follow-up.
+    pub fn instance(&self) -> Option<u8> {
+        let tx = uart_tx_instance(self.tx)?;
+        let rx = uart_rx_instance(self.rx)?;
+        (tx == rx).then_some(tx)
+    }
+}
+
+/// Hardware UART instance a GPIO can drive as TX, or `None` if it has no TX
+/// function in the common RP2040/RP2350 pin set. See [`UartConfig::instance`].
+fn uart_tx_instance(pin: u8) -> Option<u8> {
+    match pin {
+        0 | 12 | 16 | 28 => Some(0),
+        4 | 8 | 20 | 24 => Some(1),
+        _ => None,
+    }
+}
+
+/// Hardware UART instance a GPIO can drive as RX, or `None`. See
+/// [`UartConfig::instance`].
+fn uart_rx_instance(pin: u8) -> Option<u8> {
+    match pin {
+        1 | 13 | 17 | 29 => Some(0),
+        5 | 9 | 21 | 25 => Some(1),
+        _ => None,
+    }
+}
+
 /// The user-selected probe topology. This is the primary flash config block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Topology {
@@ -142,6 +186,12 @@ pub enum ValidationError {
     /// Probes cannot be binned into PIO blocks such that each block's pins
     /// fit one GPIOBASE window (RP2350B).
     PioWindow,
+    /// A UART bridge's TX/RX pins don't form a legal pair for one hardware UART
+    /// instance (carries the offending TX pin). See [`UartConfig::instance`].
+    UartPinMux(u8),
+    /// Two UART bridges resolve to the same hardware UART instance (carries the
+    /// doubly-used instance number).
+    UartInstanceConflict(u8),
 }
 
 impl Topology {
@@ -193,6 +243,20 @@ impl Topology {
             claim(u.rx)?;
         }
 
+        // UART instance legality: each bridge's TX/RX pins must select a single
+        // hardware UART, and the (≤ MAX_UARTS) bridges must use distinct
+        // instances. This lets the bridge code claim pins by instance without
+        // its own validation (`PinTable::claim_uart{0,1}`).
+        let mut used_uarts: u8 = 0;
+        for u in &self.uarts {
+            let inst = u.instance().ok_or(ValidationError::UartPinMux(u.tx))?;
+            let bit = 1u8 << inst;
+            if used_uarts & bit != 0 {
+                return Err(ValidationError::UartInstanceConflict(inst));
+            }
+            used_uarts |= bit;
+        }
+
         // TODO(rp2350b): bin probes into PIO blocks such that each block's
         // SWCLK/SWDIO pins fit a single `pio_pin_window` GPIOBASE window, and
         // reject with `ValidationError::PioWindow` if impossible. On RP2040 /
@@ -208,6 +272,10 @@ mod tests {
 
     fn probe(swclk: u8, swdio: u8) -> ProbeConfig {
         ProbeConfig { swclk, swdio, reset: None }
+    }
+
+    fn uart(tx: u8, rx: u8) -> UartConfig {
+        UartConfig { tx, rx, baud: 115200 }
     }
 
     #[test]
@@ -246,5 +314,46 @@ mod tests {
         assert_eq!(t.validate(&RP2040, &BoardProfile::PICO), Ok(()));
         t.uarts.push(UartConfig { tx: 16, rx: 17, baud: 115200 }).unwrap();
         assert_eq!(t.validate(&RP2040, &BoardProfile::PICO), Err(ValidationError::TooManyProbes));
+    }
+
+    #[test]
+    fn uart_instance_mapping() {
+        assert_eq!(uart(0, 1).instance(), Some(0));
+        assert_eq!(uart(16, 17).instance(), Some(0));
+        assert_eq!(uart(4, 5).instance(), Some(1));
+        assert_eq!(uart(20, 21).instance(), Some(1));
+        // TX and RX resolve to different instances.
+        assert_eq!(uart(0, 5).instance(), None);
+        // Neither pin has a UART function in the common set (RP2350-only pins).
+        assert_eq!(uart(10, 11).instance(), None);
+    }
+
+    #[test]
+    fn uart_mismatched_pins_rejected() {
+        let mut t = Topology::default();
+        t.uarts.push(uart(4, 1)).unwrap(); // TX=UART1, RX=UART0
+        assert_eq!(
+            t.validate(&RP2040, &BoardProfile::PICO),
+            Err(ValidationError::UartPinMux(4))
+        );
+    }
+
+    #[test]
+    fn uart_instance_conflict_rejected() {
+        let mut t = Topology::default();
+        t.uarts.push(uart(0, 1)).unwrap(); // UART0
+        t.uarts.push(uart(16, 17)).unwrap(); // UART0 again
+        assert_eq!(
+            t.validate(&RP2040, &BoardProfile::PICO),
+            Err(ValidationError::UartInstanceConflict(0))
+        );
+    }
+
+    #[test]
+    fn two_uarts_distinct_instances_valid() {
+        let mut t = Topology::default();
+        t.uarts.push(uart(0, 1)).unwrap(); // UART0
+        t.uarts.push(uart(4, 5)).unwrap(); // UART1
+        assert_eq!(t.validate(&RP2040, &BoardProfile::PICO), Ok(()));
     }
 }
