@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["probe-config", "firmware"]
+members = ["probe-config", "firmware", "cli"]
 
 [workspace.package]
 edition = "2021"
