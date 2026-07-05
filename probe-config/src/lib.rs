@@ -16,6 +16,8 @@
 #![no_std]
 #![deny(missing_docs)]
 
+pub mod protocol;
+
 use heapless::Vec;
 use serde::{Deserialize, Serialize};
 

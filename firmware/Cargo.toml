@@ -22,6 +22,7 @@ embassy-rp = { git = "https://github.com/computer-whisperer/embassy", branch = "
 embassy-usb = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6", features = ["defmt"] }
 embassy-sync = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6", features = ["defmt"] }
 embassy-futures = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6" }
+embassy-embedded-hal = { git = "https://github.com/computer-whisperer/embassy", branch = "raven_merge6" }
 
 # CMSIS-DAP protocol engine (probe-rs project). Pinned; we implement its
 # Swd/Dependencies traits over the PIO engine.
@@ -39,3 +40,5 @@ portable-atomic = { version = "1", features = ["critical-section"] }
 heapless = { version = "0.8", default-features = false }
 fixed = "1"
 embedded-hal = "1"
+postcard = { version = "1", default-features = false }
+sequential-storage = "4"

@@ -17,13 +17,13 @@
 //! `read_cmd` or `get_next_cmd` routine. One SWCLK period is 4 SM cycles.
 
 use embassy_rp::clocks::clk_sys_freq;
-use embassy_rp::gpio::{Flex, Pull};
+use embassy_rp::gpio::{AnyPin, Flex, Pull};
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
-    Common, Config, Direction as PioDirection, Instance, ShiftDirection, StateMachine,
+    Common, Config, Direction as PioDirection, Instance, LoadedProgram, Pin as PioPinHandle,
+    ShiftDirection, StateMachine,
 };
 use embassy_rp::Peri;
-use embassy_rp::gpio::Pin as GpioPin;
 use fixed::traits::ToFixed;
 
 /// Jump targets within the loaded PIO program (absolute addresses).
@@ -38,27 +38,16 @@ struct CmdAddrs {
     read: u8,
 }
 
-/// One SWD probe instance: a PIO state machine driving SWCLK/SWDIO, plus an
-/// optional open-drain-emulated nRESET pin.
-pub struct SwdEngine<'d, P: Instance, const SM: usize> {
-    sm: StateMachine<'d, P, SM>,
+/// The SWD PIO program, loaded once per PIO block and shared by its state
+/// machines.
+pub struct SwdProgram<'d, P: Instance> {
+    loaded: LoadedProgram<'d, P>,
     addrs: CmdAddrs,
-    nreset: Option<Flex<'d>>,
-    /// Last SWCLK frequency requested, to skip redundant divider writes.
-    cached_freq_khz: u32,
 }
 
-impl<'d, P: Instance, const SM: usize> SwdEngine<'d, P, SM> {
-    /// Set up GPIOs, load the SWD program (once per PIO block — pass the same
-    /// `Common` for all SMs of a block) and start the state machine idling in
-    /// `get_next_cmd`.
-    pub fn new(
-        common: &mut Common<'d, P>,
-        mut sm: StateMachine<'d, P, SM>,
-        swclk: Peri<'d, impl embassy_rp::pio::PioPin>,
-        swdio: Peri<'d, impl embassy_rp::pio::PioPin>,
-        nreset: Option<Peri<'d, impl GpioPin>>,
-    ) -> Self {
+impl<'d, P: Instance> SwdProgram<'d, P> {
+    /// Assemble and load the SWD program into a PIO block.
+    pub fn load(common: &mut Common<'d, P>) -> Self {
         let prg = pio_asm!(
             ".side_set 1 opt",
             "public write_cmd:",
@@ -81,7 +70,6 @@ impl<'d, P: Instance, const SM: usize> SwdEngine<'d, P, SM> {
             "    push",
             ".wrap",
         );
-
         let loaded = common.load_program(&prg.program);
         let origin = loaded.origin;
         let addrs = CmdAddrs {
@@ -90,15 +78,86 @@ impl<'d, P: Instance, const SM: usize> SwdEngine<'d, P, SM> {
             turnaround: origin + prg.public_defines.turnaround_cmd as u8,
             read: origin + prg.public_defines.read_cmd as u8,
         };
+        Self { loaded, addrs }
+    }
+}
 
-        let mut swclk = common.make_pio_pin(swclk);
-        let mut swdio = common.make_pio_pin(swdio);
+/// Object-safe SWD wire operations — what the DAP layer needs from an
+/// engine, independent of which PIO block / state machine backs it.
+pub trait SwdBus: Send {
+    /// Set the SWCLK frequency.
+    fn set_swclk_freq_khz(&mut self, freq_khz: u32);
+    /// Clock out `bit_count` (1..=32) bits, LSB first, driving SWDIO.
+    fn write_bits(&mut self, bit_count: u32, data: u32);
+    /// Clock in `bit_count` (1..=32) bits, LSB first, SWDIO released.
+    fn read_bits(&mut self, bit_count: u32) -> u32;
+    /// Run `bit_count` clocks with SWDIO released (turnaround / line idle).
+    fn hiz_clocks(&mut self, bit_count: u32);
+    /// Switch SWDIO to input (probe releases the line). Blocks until applied.
+    fn read_mode(&mut self);
+    /// Switch SWDIO to output (probe drives the line). Blocks until applied.
+    fn write_mode(&mut self);
+    /// Drive (true) or release (false) the nRESET line.
+    fn set_nreset(&mut self, asserted: bool);
+    /// Current level of the nRESET line (true = high / released).
+    fn nreset_level(&mut self) -> bool;
+}
+
+impl<'d, P: Instance + Send, const SM: usize> SwdBus for SwdEngine<'d, P, SM> {
+    fn set_swclk_freq_khz(&mut self, freq_khz: u32) {
+        SwdEngine::set_swclk_freq_khz(self, freq_khz)
+    }
+    fn write_bits(&mut self, bit_count: u32, data: u32) {
+        SwdEngine::write_bits(self, bit_count, data)
+    }
+    fn read_bits(&mut self, bit_count: u32) -> u32 {
+        SwdEngine::read_bits(self, bit_count)
+    }
+    fn hiz_clocks(&mut self, bit_count: u32) {
+        SwdEngine::hiz_clocks(self, bit_count)
+    }
+    fn read_mode(&mut self) {
+        SwdEngine::read_mode(self)
+    }
+    fn write_mode(&mut self) {
+        SwdEngine::write_mode(self)
+    }
+    fn set_nreset(&mut self, asserted: bool) {
+        SwdEngine::set_nreset(self, asserted)
+    }
+    fn nreset_level(&mut self) -> bool {
+        SwdEngine::nreset_level(self)
+    }
+}
+
+/// One SWD probe instance: a PIO state machine driving SWCLK/SWDIO, plus an
+/// optional open-drain-emulated nRESET pin.
+pub struct SwdEngine<'d, P: Instance, const SM: usize> {
+    sm: StateMachine<'d, P, SM>,
+    addrs: CmdAddrs,
+    nreset: Option<Flex<'d>>,
+    /// Last SWCLK frequency requested, to skip redundant divider writes.
+    cached_freq_khz: u32,
+}
+
+impl<'d, P: Instance, const SM: usize> SwdEngine<'d, P, SM> {
+    /// Set up GPIOs and start the state machine idling in `get_next_cmd`.
+    /// `program` must be loaded into the same PIO block as `sm`.
+    pub fn new(
+        program: &SwdProgram<'d, P>,
+        mut sm: StateMachine<'d, P, SM>,
+        mut swclk: PioPinHandle<'d, P>,
+        mut swdio: PioPinHandle<'d, P>,
+        nreset: Option<Peri<'d, AnyPin>>,
+    ) -> Self {
+        let addrs = program.addrs;
+
         // SWDIO idles high; pull-up so reads see a released line as 1.
         swdio.set_pull(Pull::Up);
         swclk.set_pull(Pull::None);
 
         let mut cfg = Config::default();
-        cfg.use_program(&loaded, &[&swclk]); // side-set = SWCLK
+        cfg.use_program(&program.loaded, &[&swclk]); // side-set = SWCLK
         cfg.set_out_pins(&[&swdio]);
         cfg.set_set_pins(&[&swdio]);
         cfg.set_in_pins(&[&swdio]);

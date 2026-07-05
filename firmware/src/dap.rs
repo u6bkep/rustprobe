@@ -2,6 +2,8 @@
 //!
 //! The SWD transfer logic is a port of debugprobe's `sw_dp_pio.c`
 //! (`SWD_Transfer` et al.), restructured into dap-rs's `Swd` trait shape.
+//! The engine is type-erased (`dyn SwdBus`) so one concrete `ProbeContext`
+//! serves every PIO block / state machine combination.
 //!
 //! Differences from the C original, both deliberate:
 //! * Turnaround is fixed at 1 cycle and the WAIT/FAULT data phase is off
@@ -15,23 +17,22 @@
 use dap_rs::dap::{DapLeds, HostStatus};
 use dap_rs::swd::{APnDP, Ack, DPRegister, RnW};
 use dap_rs::{jtag, swd, swj};
-use embassy_rp::pio::Instance;
 use embassy_time::{block_for, Duration, Instant};
 
-use crate::swd::SwdEngine;
+use crate::instances::DynEngine;
 
 /// Fixed 1-cycle turnaround (see module docs).
 const TRN: u32 = 1;
 
 /// Owns one probe instance's hardware; morphed between mode states by dap-rs.
-pub struct ProbeContext<'d, P: Instance, const SM: usize> {
-    engine: SwdEngine<'d, P, SM>,
+pub struct ProbeContext {
+    engine: DynEngine,
     swd_config: swd::Config,
     jtag_config: jtag::Config,
 }
 
-impl<'d, P: Instance, const SM: usize> ProbeContext<'d, P, SM> {
-    pub fn new(engine: SwdEngine<'d, P, SM>) -> Self {
+impl ProbeContext {
+    pub fn new(engine: DynEngine) -> Self {
         Self {
             engine,
             swd_config: swd::Config::default(),
@@ -50,9 +51,7 @@ impl<'d, P: Instance, const SM: usize> ProbeContext<'d, P, SM> {
     }
 }
 
-impl<'d, P: Instance, const SM: usize> swj::Dependencies<ProbeSwd<'d, P, SM>, ProbeJtag<'d, P, SM>>
-    for ProbeContext<'d, P, SM>
-{
+impl swj::Dependencies<ProbeSwd, ProbeJtag> for ProbeContext {
     fn process_swj_pins(&mut self, output: swj::Pins, mask: swj::Pins, wait_us: u32) -> swj::Pins {
         // SWCLK/SWDIO are owned by the PIO state machine and are not
         // individually drivable; like the C firmware, only nRESET is
@@ -103,22 +102,22 @@ impl<'d, P: Instance, const SM: usize> swj::Dependencies<ProbeSwd<'d, P, SM>, Pr
 }
 
 /// SWD mode state.
-pub struct ProbeSwd<'d, P: Instance, const SM: usize>(ProbeContext<'d, P, SM>);
+pub struct ProbeSwd(ProbeContext);
 
-impl<'d, P: Instance, const SM: usize> From<ProbeContext<'d, P, SM>> for ProbeSwd<'d, P, SM> {
-    fn from(mut ctx: ProbeContext<'d, P, SM>) -> Self {
+impl From<ProbeContext> for ProbeSwd {
+    fn from(ctx: ProbeContext) -> Self {
         ctx.engine.write_mode();
         Self(ctx)
     }
 }
 
-impl<'d, P: Instance, const SM: usize> From<ProbeSwd<'d, P, SM>> for ProbeContext<'d, P, SM> {
-    fn from(swd: ProbeSwd<'d, P, SM>) -> Self {
+impl From<ProbeSwd> for ProbeContext {
+    fn from(swd: ProbeSwd) -> Self {
         swd.0
     }
 }
 
-impl<'d, P: Instance, const SM: usize> ProbeSwd<'d, P, SM> {
+impl ProbeSwd {
     /// Read the 3-bit ACK (preceded by the read turnaround).
     fn read_ack(&mut self) -> Result<(), swd::Error> {
         let ack = (self.0.engine.read_bits(TRN + 3) >> TRN) as u8;
@@ -146,8 +145,8 @@ impl<'d, P: Instance, const SM: usize> ProbeSwd<'d, P, SM> {
     }
 }
 
-impl<'d, P: Instance, const SM: usize> swd::Swd<ProbeContext<'d, P, SM>> for ProbeSwd<'d, P, SM> {
-    fn available(_deps: &ProbeContext<'d, P, SM>) -> bool {
+impl swd::Swd<ProbeContext> for ProbeSwd {
+    fn available(_deps: &ProbeContext) -> bool {
         true
     }
 
@@ -174,7 +173,7 @@ impl<'d, P: Instance, const SM: usize> swd::Swd<ProbeContext<'d, P, SM>> for Pro
         self.0.engine.hiz_clocks(TRN);
         self.trailing_idle();
 
-        if (val.count_ones() as u32 ^ parity) & 1 != 0 {
+        if (val.count_ones() ^ parity) & 1 != 0 {
             return Err(swd::Error::BadParity);
         }
         Ok(val)
@@ -228,22 +227,22 @@ impl<'d, P: Instance, const SM: usize> swd::Swd<ProbeContext<'d, P, SM>> for Pro
 
 /// JTAG mode state — not implemented (reported unavailable), kept as the
 /// expansion seam for a future JTAG PIO program.
-pub struct ProbeJtag<'d, P: Instance, const SM: usize>(ProbeContext<'d, P, SM>);
+pub struct ProbeJtag(ProbeContext);
 
-impl<'d, P: Instance, const SM: usize> From<ProbeContext<'d, P, SM>> for ProbeJtag<'d, P, SM> {
-    fn from(ctx: ProbeContext<'d, P, SM>) -> Self {
+impl From<ProbeContext> for ProbeJtag {
+    fn from(ctx: ProbeContext) -> Self {
         Self(ctx)
     }
 }
 
-impl<'d, P: Instance, const SM: usize> From<ProbeJtag<'d, P, SM>> for ProbeContext<'d, P, SM> {
-    fn from(jtag: ProbeJtag<'d, P, SM>) -> Self {
+impl From<ProbeJtag> for ProbeContext {
+    fn from(jtag: ProbeJtag) -> Self {
         jtag.0
     }
 }
 
-impl<'d, P: Instance, const SM: usize> jtag::Jtag<ProbeContext<'d, P, SM>> for ProbeJtag<'d, P, SM> {
-    fn available(_deps: &ProbeContext<'d, P, SM>) -> bool {
+impl jtag::Jtag<ProbeContext> for ProbeJtag {
+    fn available(_deps: &ProbeContext) -> bool {
         false
     }
 
