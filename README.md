@@ -80,6 +80,20 @@ config vendor commands + host CLI, core-1 execution of the DAP tasks. The SWD
 wire engine is the C firmware's `probe.pio` command FIFO program driven
 through dap-rs's `Swd`/`Dependencies` traits.
 
+Hardware-validated on an RP2040 Pico (July 2026): probe-rs walks a Pico 2 W's
+CoreSight topology and sustains ~110 KB/s verified RAM read/write at 3 MHz
+SWD; topology set/get/commit over USB survives reflash. `bcdDevice` reports
+2.20 because probe-rs deny-lists `2e8a:000c` below that (picoprobe era).
+
+Reflashing without the BOOTSEL button: `rustprobe reboot --bootsel` (a bulk
+vendor command), then `picotool load -v -x <elf>`. The firmware also carries
+the pico-sdk USB reset interface (vendor class FF/00/01, added last), but
+stock picotool only reaches its reset-interface scan with explicit
+`--vid 0x2e8a --pid 0x000c`: unknown PIDs under the Raspberry Pi VID are
+classified (and rejected) before that scan. The reset/CDC interface numbers
+move when the probe count changes — find the reset interface by its class
+triple, never by a cached number.
+
 CDC-UART bridges (ports `debugprobe/src/cdc_uart.c`): one embassy
 `CdcAcmClass` + `BufferedUart` per configured UART, bridged bidirectionally on
 the core-0 executor. Host line-coding sets baud live (`BufferedUart` has no
