@@ -14,4 +14,9 @@ runner = "probe-rs run --chip RP235x"
 [env]
 DEFMT_LOG = "info"
 # 12 DAP vendor interfaces + 2 CDC UARTs × 2 interfaces (default is 4).
+# The picotool reset interface also fits: worst legal topology is 11 probes +
+# 2 UARTs (12 probes + 2 UARTs exceeds the IN-endpoint budget), 15 + 1 = 16.
 EMBASSY_USB_MAX_INTERFACE_COUNT = "16"
+# 2 CDC control handlers + interface strings + reset interface (default is 4,
+# which is exactly full — leave headroom).
+EMBASSY_USB_MAX_HANDLER_COUNT = "8"

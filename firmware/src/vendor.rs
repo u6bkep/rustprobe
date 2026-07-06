@@ -153,6 +153,19 @@ impl ConfigService {
         2
     }
 
+    /// Arm the watchdog to hard-reset after `delay` (sync, for the USB reset
+    /// interface's control handler). Returns false if the watchdog is locked,
+    /// which only happens when a vendor-command reboot is already in flight.
+    pub fn arm_watchdog_reboot(&self, delay: embassy_time::Duration) -> bool {
+        match self.watchdog.try_lock() {
+            Ok(mut wd) => {
+                wd.start(delay);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Reset the probe (does not return).
     pub async fn reboot(&self) -> ! {
         // Give the host time to collect the response.

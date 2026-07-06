@@ -12,6 +12,7 @@ mod autobaud;
 mod dap;
 mod flash_config;
 mod instances;
+mod reset_iface;
 mod swd;
 mod uart_bridge;
 mod vendor;
@@ -107,14 +108,22 @@ type DapHandler = dap_rs::dap::Dap<
     dap_rs::swo::NoSwo,
 >;
 
-/// Serves the CMSIS-DAP interface string (probe-rs discovers probes by it).
+/// Serves the CMSIS-DAP interface string (probe-rs discovers probes by it)
+/// and the pico-sdk-style "Reset" interface string.
 struct InterfaceStrings {
     dap_str: StringIndex,
+    reset_str: StringIndex,
 }
 
 impl Handler for InterfaceStrings {
     fn get_string(&mut self, index: StringIndex, _lang_id: u16) -> Option<&str> {
-        (index == self.dap_str).then_some(DAP_INTERFACE_STRING)
+        if index == self.dap_str {
+            Some(DAP_INTERFACE_STRING)
+        } else if index == self.reset_str {
+            Some("Reset")
+        } else {
+            None
+        }
     }
 }
 
@@ -207,6 +216,29 @@ async fn main(spawner: Spawner) {
     };
     let (engines, autobaud_sm) = build_engines(&topology, blocks, &mut pins);
 
+    // --- Config service -----------------------------------------------------
+    // Built before the USB device: the reset interface's control handler
+    // shares its watchdog.
+    let info = FirmwareInfo {
+        protocol_version: PROTOCOL_VERSION,
+        firmware_version: fw_version(),
+        chip: CHIP,
+        limits: LIMITS,
+        active_probes: topology.probes.len() as u8,
+        active_uarts: topology.uarts.len() as u8,
+        config_fault,
+    };
+    static SERVICE: StaticCell<ConfigService> = StaticCell::new();
+    let service: &'static ConfigService = SERVICE.init(ConfigService::new(
+        Watchdog::new(p.WATCHDOG),
+        info,
+        topology.clone(),
+        LIMITS,
+        profile,
+    ));
+    // Flash ops must run on core 0; the worker owns the flash from here on.
+    spawner.spawn(flash_config::flash_worker(flash).unwrap());
+
     // --- USB device ---------------------------------------------------------
     let driver = Driver::new(p.USB, Irqs);
 
@@ -271,31 +303,18 @@ async fn main(spawner: Spawner) {
             .expect("MAX_UARTS");
     }
 
+    // pico-sdk style reset interface (picotool force-reboot), added last so
+    // the DAP interfaces keep numbers 0..probes and CDC numbering matches the
+    // C firmware.
+    let reset_str = builder.string();
+    let reset_handler = reset_iface::ResetHandler::add(&mut builder, service, reset_str);
+    static RESET_HANDLER: StaticCell<reset_iface::ResetHandler> = StaticCell::new();
+    builder.handler(RESET_HANDLER.init(reset_handler));
+
     static STRINGS: StaticCell<InterfaceStrings> = StaticCell::new();
-    builder.handler(STRINGS.init(InterfaceStrings { dap_str }));
+    builder.handler(STRINGS.init(InterfaceStrings { dap_str, reset_str }));
 
     let usb = builder.build();
-
-    // --- Config service -----------------------------------------------------
-    let info = FirmwareInfo {
-        protocol_version: PROTOCOL_VERSION,
-        firmware_version: fw_version(),
-        chip: CHIP,
-        limits: LIMITS,
-        active_probes: topology.probes.len() as u8,
-        active_uarts: topology.uarts.len() as u8,
-        config_fault,
-    };
-    static SERVICE: StaticCell<ConfigService> = StaticCell::new();
-    let service: &'static ConfigService = SERVICE.init(ConfigService::new(
-        Watchdog::new(p.WATCHDOG),
-        info,
-        topology.clone(),
-        LIMITS,
-        profile,
-    ));
-    // Flash ops must run on core 0; the worker owns the flash from here on.
-    spawner.spawn(flash_config::flash_worker(flash).unwrap());
 
     // --- DAP handlers, executed on core 1 ----------------------------------
     let mut daps: Vec<(DapHandler, Endpoint<'static, USB, Out>, Endpoint<'static, USB, In>, &'static str), MAX_PROBES> =
