@@ -1632,6 +1632,7 @@ dependencies = [
  "postcard",
  "probe-config",
  "sequential-storage",
+ "serde",
  "static_cell",
 ]
 

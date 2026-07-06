@@ -1,0 +1,4 @@
+# Waveshare RP2350-Zero: GP0-GP15 and GP26-GP29 on the edge pads.
+# GP16 drives the onboard WS2812 RGB LED; GP17-GP25 are not brought out.
+available = "0-16,26-29"
+reserved = "16"

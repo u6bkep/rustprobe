@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use probe_config::protocol::*;
-use probe_config::Topology;
+use probe_config::{BoardProfile, Topology};
 
 use crate::transport::Probe;
 
@@ -90,6 +90,24 @@ impl Session {
         Ok(())
     }
 
+    /// Read the current board profile (`CMD_GET_PROFILE`, protocol ≥ 2).
+    pub fn get_profile(&self) -> Result<BoardProfile> {
+        let resp = self.probe.transceive(&[CMD_GET_PROFILE])?;
+        check(&resp, CMD_GET_PROFILE)?;
+        postcard::from_bytes(&resp[2..]).context("decode BoardProfile")
+    }
+
+    /// Validate-and-store a board profile (`CMD_SET_PROFILE`, protocol ≥ 2).
+    /// Takes effect immediately for topology commits; the stored topology is
+    /// only re-checked against it at the next boot.
+    pub fn set_profile(&self, profile: &BoardProfile) -> Result<()> {
+        let mut req = vec![CMD_SET_PROFILE];
+        req.extend_from_slice(&postcard::to_stdvec(profile).context("encode BoardProfile")?);
+        let resp = self.probe.transceive(&req)?;
+        check(&resp, CMD_SET_PROFILE)?;
+        Ok(())
+    }
+
     /// Reboot the probe (`CMD_REBOOT`); it re-enumerates afterward.
     pub fn reboot(&self) -> Result<()> {
         let resp = self.probe.transceive(&[CMD_REBOOT])?;
@@ -110,7 +128,7 @@ fn status_str(status: u8) -> &'static str {
     match status {
         STATUS_OK => "ok",
         STATUS_ERR_DECODE => "payload failed to decode",
-        STATUS_ERR_INVALID => "topology failed validation",
+        STATUS_ERR_INVALID => "failed validation",
         STATUS_ERR_FLASH => "flash write failed",
         STATUS_ERR_BAD_REQUEST => "unknown command or malformed arguments",
         _ => "unknown status",

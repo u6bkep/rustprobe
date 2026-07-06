@@ -48,12 +48,30 @@ rustprobe info                        # chip, fw/protocol version, limits, activ
 rustprobe get > topology.toml         # dump the active topology as TOML
 rustprobe set topology.toml           # validate + stage + commit a new topology
 rustprobe set topology.toml --reboot  # ...and reboot so it takes effect
+rustprobe get-board                   # dump the current board profile as TOML
+rustprobe set-board configs/boards/rp2350-zero.toml  # store a board profile
 rustprobe reboot                      # reboot the probe
 ```
 
 Use `--serial <uid:0>` (from `rustprobe list`) to pick one when several probes
-are attached. `set` validates locally against the chip limits reported by
-`info` before staging; the firmware re-validates on commit.
+are attached. `set` validates locally against the chip limits and board
+profile reported by `info` before staging; the firmware re-validates on
+commit.
+
+The board profile — which GPIOs are wired out and which are reserved for the
+board itself (LEDs etc.) — is stored in flash alongside the topology and
+defaults to a bare Pico. Presets live in `configs/boards/`; the TOML form is
+pin-range strings:
+
+```toml
+# Waveshare RP2350-Zero
+available = "0-16,26-29"
+reserved = "16"   # WS2812 LED
+```
+
+`set-board` takes effect immediately for later `set` commits and warns if the
+active topology violates the new profile (the firmware falls back to its
+default topology at the next boot if the stored one no longer validates).
 
 Topology TOML mirrors the `Topology` type — arrays-of-tables of probes and
 UARTs (`reset` is optional):

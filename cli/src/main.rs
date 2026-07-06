@@ -4,6 +4,7 @@
 //! vendor-bulk CMSIS-DAP interfaces. See `transport` for the USB layer and
 //! `session` for the protocol framing.
 
+mod board_toml;
 mod session;
 mod topology_toml;
 mod transport;
@@ -15,6 +16,7 @@ use clap::{Parser, Subcommand};
 use probe_config::protocol::FirmwareInfo;
 use probe_config::BoardProfile;
 
+use crate::board_toml::TomlBoardProfile;
 use crate::session::Session;
 use crate::topology_toml::TomlTopology;
 use crate::transport::Probe;
@@ -46,6 +48,13 @@ enum Command {
         #[arg(long)]
         reboot: bool,
     },
+    /// Read the current board profile and print it as TOML.
+    GetBoard,
+    /// Validate a TOML board profile file and write it to the probe.
+    SetBoard {
+        /// Path to a TOML board profile file (see configs/boards/).
+        file: PathBuf,
+    },
     /// Reboot the probe.
     Reboot {
         /// Reboot into the BOOTSEL bootloader (for flashing with picotool).
@@ -62,6 +71,8 @@ fn main() -> Result<()> {
         Command::Info => cmd_info(serial),
         Command::Get => cmd_get(serial),
         Command::Set { file, reboot } => cmd_set(serial, &file, reboot),
+        Command::GetBoard => cmd_get_board(serial),
+        Command::SetBoard { file } => cmd_set_board(serial, &file),
         Command::Reboot { bootsel } => cmd_reboot(serial, bootsel),
     }
 }
@@ -88,7 +99,15 @@ fn cmd_list() -> Result<()> {
 }
 
 fn cmd_info(serial: Option<&str>) -> Result<()> {
-    print_info(&open(serial)?.info()?);
+    let session = open(serial)?;
+    let info = session.info()?;
+    print_info(&info);
+    if info.protocol_version >= 2 {
+        let profile = session.get_profile()?;
+        println!("board profile:");
+        println!("  available:      {}", board_toml::format_pin_ranges(profile.available));
+        println!("  reserved:       {}", board_toml::format_pin_ranges(profile.reserved));
+    }
     Ok(())
 }
 
@@ -112,11 +131,10 @@ fn cmd_set(serial: Option<&str>, file: &PathBuf, reboot: bool) -> Result<()> {
 
     let session = open(serial)?;
 
-    // Validate locally against the chip's reported limits before staging.
-    // TODO(board-profile): the firmware does not yet report its BoardProfile,
-    // so assume a bare Pico. Fetch it via the protocol once it does.
+    // Validate locally against the chip's reported limits and board profile
+    // before staging.
     let info = session.info()?;
-    let profile = BoardProfile::PICO;
+    let profile = device_profile(&session, &info)?;
     topo.validate(&info.limits, &profile)
         .map_err(|e| anyhow::anyhow!("topology rejected by local validation: {e:?}"))?;
 
@@ -132,6 +150,70 @@ fn cmd_set(serial: Option<&str>, file: &PathBuf, reboot: bool) -> Result<()> {
         println!("reboot requested; the probe will re-enumerate");
     } else {
         println!("run `rustprobe reboot` to apply (or re-run with --reboot)");
+    }
+    Ok(())
+}
+
+/// The board profile the device validates against: fetched over the protocol,
+/// or the Pico default (with a warning) for pre-profile firmware.
+fn device_profile(session: &Session, info: &FirmwareInfo) -> Result<BoardProfile> {
+    if info.protocol_version >= 2 {
+        session.get_profile()
+    } else {
+        eprintln!(
+            "warning: firmware protocol version {} predates board profiles; assuming a bare Pico",
+            info.protocol_version
+        );
+        Ok(BoardProfile::PICO)
+    }
+}
+
+fn cmd_get_board(serial: Option<&str>) -> Result<()> {
+    let session = open(serial)?;
+    let info = session.info()?;
+    let profile = device_profile(&session, &info)?;
+    print!(
+        "{}",
+        toml::to_string(&TomlBoardProfile::from_profile(&profile))
+            .context("serialize board profile to TOML")?
+    );
+    Ok(())
+}
+
+fn cmd_set_board(serial: Option<&str>, file: &PathBuf) -> Result<()> {
+    let text = std::fs::read_to_string(file)
+        .with_context(|| format!("read {}", file.display()))?;
+    let parsed: TomlBoardProfile = toml::from_str(&text).context("parse TOML board profile")?;
+    let profile = parsed.into_profile()?;
+
+    let session = open(serial)?;
+    let info = session.info()?;
+    if info.protocol_version < 2 {
+        anyhow::bail!(
+            "firmware protocol version {} predates board profiles; reflash the firmware first",
+            info.protocol_version
+        );
+    }
+    profile
+        .validate(&info.limits)
+        .map_err(|e| anyhow::anyhow!("board profile rejected by local validation: {e:?}"))?;
+
+    session.set_profile(&profile)?;
+    println!(
+        "board profile written (available {}, reserved {})",
+        board_toml::format_pin_ranges(profile.available),
+        board_toml::format_pin_ranges(profile.reserved),
+    );
+
+    // The firmware re-checks the stored topology against the profile at boot;
+    // warn now if the currently-active topology would fail that check.
+    let topo = session.get_topology()?;
+    if let Err(e) = topo.validate(&info.limits, &profile) {
+        eprintln!(
+            "warning: the active topology violates the new profile ({e:?}); \
+             the probe will fall back to its default topology on next boot \
+             unless you `set` a compatible one"
+        );
     }
     Ok(())
 }

@@ -10,7 +10,7 @@ use embassy_time::Timer;
 use probe_config::protocol::*;
 use probe_config::{BoardProfile, ChipLimits, Topology};
 
-use crate::flash_config::commit_topology;
+use crate::flash_config::{commit_profile, commit_topology};
 
 /// Max payload bytes per GET_TOPOLOGY response chunk
 /// (64-byte packet minus cmd, status, total_len).
@@ -28,7 +28,9 @@ pub struct ConfigService {
     info: FirmwareInfo,
     active: Topology,
     limits: ChipLimits,
-    profile: BoardProfile,
+    /// Current board profile. Updated in place by `CMD_SET_PROFILE` so later
+    /// topology commits validate against the new profile without a reboot.
+    profile: Mutex<CriticalSectionRawMutex, BoardProfile>,
 }
 
 /// What the DAP task should do after sending the response.
@@ -53,7 +55,7 @@ impl ConfigService {
             info,
             active,
             limits,
-            profile,
+            profile: Mutex::new(profile),
         }
     }
 
@@ -76,6 +78,8 @@ impl ConfigService {
             CMD_GET_TOPOLOGY => self.get_topology(request, response),
             CMD_SET_TOPOLOGY => self.set_topology(request, response).await,
             CMD_COMMIT => self.commit(request, response).await,
+            CMD_GET_PROFILE => self.get_profile(response).await,
+            CMD_SET_PROFILE => self.set_profile(request, response).await,
             CMD_REBOOT => {
                 after = AfterResponse::Reboot;
                 2
@@ -149,13 +153,44 @@ impl ConfigService {
                 return 2;
             }
         };
-        if topo.validate(&self.limits, &self.profile).is_err() {
+        if topo.validate(&self.limits, &*self.profile.lock().await).is_err() {
             response[1] = STATUS_ERR_INVALID;
             return 2;
         }
         if commit_topology(topo).await.is_err() {
             response[1] = STATUS_ERR_FLASH;
         }
+        2
+    }
+
+    async fn get_profile(&self, response: &mut [u8]) -> usize {
+        let profile = *self.profile.lock().await;
+        match postcard::to_slice(&profile, &mut response[2..]) {
+            Ok(payload) => 2 + payload.len(),
+            Err(_) => {
+                response[1] = STATUS_ERR_DECODE;
+                2
+            }
+        }
+    }
+
+    async fn set_profile(&self, request: &[u8], response: &mut [u8]) -> usize {
+        let profile: BoardProfile = match postcard::from_bytes(&request[1..]) {
+            Ok(p) => p,
+            Err(_) => {
+                response[1] = STATUS_ERR_DECODE;
+                return 2;
+            }
+        };
+        if profile.validate(&self.limits).is_err() {
+            response[1] = STATUS_ERR_INVALID;
+            return 2;
+        }
+        if commit_profile(profile).await.is_err() {
+            response[1] = STATUS_ERR_FLASH;
+            return 2;
+        }
+        *self.profile.lock().await = profile;
         2
     }
 

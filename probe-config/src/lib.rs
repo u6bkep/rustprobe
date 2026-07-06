@@ -123,6 +123,19 @@ impl BoardProfile {
     pub fn is_assignable(&self, pin: u8) -> bool {
         pin < 64 && (self.available & !self.reserved) & (1u64 << pin) != 0
     }
+
+    /// Validate this profile against chip limits: every available pin must
+    /// exist on the chip, and at least one pin must remain assignable.
+    pub fn validate(&self, chip: &ChipLimits) -> Result<(), ValidationError> {
+        let gpio_mask = (1u64 << chip.gpio_count) - 1;
+        if self.available & !gpio_mask != 0 {
+            return Err(ValidationError::ProfilePinRange);
+        }
+        if self.available & !self.reserved == 0 {
+            return Err(ValidationError::ProfileEmpty);
+        }
+        Ok(())
+    }
 }
 
 /// Per-chip hardware limits, selected by the firmware build (and reported to
@@ -192,6 +205,11 @@ pub enum ValidationError {
     /// Two UART bridges resolve to the same hardware UART instance (carries the
     /// doubly-used instance number).
     UartInstanceConflict(u8),
+    /// A board profile marks pins available that don't exist on this chip.
+    ProfilePinRange,
+    /// A board profile leaves no pin assignable (available minus reserved is
+    /// empty).
+    ProfileEmpty,
 }
 
 impl Topology {
@@ -302,6 +320,19 @@ mod tests {
             t.validate(&RP2040, &BoardProfile::PICO),
             Err(ValidationError::PinUnavailable(25))
         );
+    }
+
+    #[test]
+    fn profile_validation() {
+        assert_eq!(BoardProfile::PICO.validate(&RP2040), Ok(()));
+        assert_eq!(BoardProfile::PICO.validate(&RP2350A), Ok(()));
+        // Available pins beyond the chip's GPIO count are rejected.
+        let wide = BoardProfile { available: 1 << 30, reserved: 0 };
+        assert_eq!(wide.validate(&RP2040), Err(ValidationError::ProfilePinRange));
+        assert_eq!(wide.validate(&RP2350B), Ok(()));
+        // A profile with nothing assignable is rejected.
+        let empty = BoardProfile { available: 0xFF, reserved: 0xFF };
+        assert_eq!(empty.validate(&RP2040), Err(ValidationError::ProfileEmpty));
     }
 
     #[test]

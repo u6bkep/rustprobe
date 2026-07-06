@@ -1,0 +1,5 @@
+# Bare Raspberry Pi Pico / Pico 2: GP0-GP22 + GP26-GP28 on the headers.
+# GP23-GP25 (SMPS mode, VBUS sense, LED) and GP29 (VSYS/3 ADC) belong to the
+# board. This matches the firmware's built-in default profile.
+available = "0-28"
+reserved = "23-25,29"

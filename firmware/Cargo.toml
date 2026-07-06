@@ -44,3 +44,4 @@ embedded-hal = "1"
 embedded-io-async = "0.7"
 postcard = { version = "1", default-features = false }
 sequential-storage = "4"
+serde = { version = "1", default-features = false }

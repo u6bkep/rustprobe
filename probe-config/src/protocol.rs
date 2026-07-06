@@ -31,12 +31,22 @@ pub const CMD_REBOOT: u8 = 0x84;
 /// `[CMD_BOOTSEL]` → `[cmd, status]`, then the probe reboots into the
 /// BOOTSEL bootloader (for picotool flashing without the button).
 pub const CMD_BOOTSEL: u8 = 0x85;
+/// `[CMD_GET_PROFILE]` → `[cmd, status, postcard(BoardProfile)]`
+/// Returns the *current* board profile (stored, or the built-in default),
+/// including a profile set since boot. Fits one packet — no chunking.
+/// Protocol version ≥ 2.
+pub const CMD_GET_PROFILE: u8 = 0x86;
+/// `[CMD_SET_PROFILE, postcard(BoardProfile)...]` → `[cmd, status]`
+/// Validates the profile against chip limits, writes it to flash, and applies
+/// it immediately for subsequent topology commits. Does not re-validate the
+/// stored topology; that happens at the next boot. Protocol version ≥ 2.
+pub const CMD_SET_PROFILE: u8 = 0x87;
 
 /// Command handled successfully.
 pub const STATUS_OK: u8 = 0x00;
 /// Payload failed to decode.
 pub const STATUS_ERR_DECODE: u8 = 0x01;
-/// Topology failed validation (see `FirmwareInfo` for limits).
+/// Topology or profile failed validation (see `FirmwareInfo` for limits).
 pub const STATUS_ERR_INVALID: u8 = 0x02;
 /// Flash write failed.
 pub const STATUS_ERR_FLASH: u8 = 0x03;
@@ -45,6 +55,9 @@ pub const STATUS_ERR_BAD_REQUEST: u8 = 0x04;
 
 /// Maximum size of a postcard-encoded `Topology` the protocol supports.
 pub const TOPOLOGY_BUF_LEN: usize = 128;
+
+/// Maximum size of a postcard-encoded `BoardProfile` (two varint u64s).
+pub const PROFILE_BUF_LEN: usize = 20;
 
 use serde::{Deserialize, Serialize};
 
@@ -80,4 +93,8 @@ pub struct FirmwareInfo {
 }
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 1;
+///
+/// History:
+/// * 1 — initial: info, get/set topology, commit, reboot, bootsel.
+/// * 2 — board profiles: `CMD_GET_PROFILE` / `CMD_SET_PROFILE`.
+pub const PROTOCOL_VERSION: u8 = 2;

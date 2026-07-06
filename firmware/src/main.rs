@@ -38,7 +38,7 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 use crate::dap::{NoLeds, ProbeContext, ProbeJtag, ProbeSwd};
-use crate::flash_config::{load_topology, ProbeFlash, FLASH_SIZE};
+use crate::flash_config::{load_profile, load_topology, ProbeFlash, FLASH_SIZE};
 use crate::instances::{build_engines, PinTable, PioBlocks};
 use crate::uart_bridge::CdcClass;
 use crate::vendor::{AfterResponse, ConfigService};
@@ -174,7 +174,17 @@ async fn main(spawner: Spawner) {
     let uid = unique_id(&mut flash);
     let mut flash: ProbeFlash = BlockingAsync::new(flash);
 
-    let profile = BoardProfile::PICO;
+    // Stored board profile, or the built-in Pico default. A stored profile
+    // that doesn't fit this chip (e.g. flash carried over from another board)
+    // is ignored rather than trusted.
+    let profile = match load_profile(&mut flash).await {
+        Some(p) if p.validate(&LIMITS).is_ok() => p,
+        Some(_) => {
+            warn!("stored board profile invalid for this chip, using Pico default");
+            BoardProfile::PICO
+        }
+        None => BoardProfile::PICO,
+    };
     let (topology, config_fault) = match load_topology(&mut flash).await {
         Some(t) if t.validate(&LIMITS, &profile).is_ok() => (t, false),
         Some(_) => {
