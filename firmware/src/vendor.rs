@@ -84,18 +84,6 @@ impl ConfigService {
                 after = AfterResponse::Bootsel;
                 2
             }
-            // TODO(remove-diag): dump the reset-interface control-request ring.
-            CMD_CTRL_DIAG => {
-                let mut n = 0;
-                crate::reset_iface::CTRL_DIAG.lock(|d| {
-                    for (i, entry) in d.borrow().iter().enumerate() {
-                        response[3 + i * 8..3 + i * 8 + 8].copy_from_slice(entry);
-                        n = i + 1;
-                    }
-                });
-                response[2] = n as u8;
-                3 + n * 8
-            }
             _ => {
                 response[1] = STATUS_ERR_BAD_REQUEST;
                 2
