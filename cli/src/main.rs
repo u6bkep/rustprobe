@@ -47,7 +47,11 @@ enum Command {
         reboot: bool,
     },
     /// Reboot the probe.
-    Reboot,
+    Reboot {
+        /// Reboot into the BOOTSEL bootloader (for flashing with picotool).
+        #[arg(long)]
+        bootsel: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -58,7 +62,7 @@ fn main() -> Result<()> {
         Command::Info => cmd_info(serial),
         Command::Get => cmd_get(serial),
         Command::Set { file, reboot } => cmd_set(serial, &file, reboot),
-        Command::Reboot => cmd_reboot(serial),
+        Command::Reboot { bootsel } => cmd_reboot(serial, bootsel),
     }
 }
 
@@ -132,9 +136,14 @@ fn cmd_set(serial: Option<&str>, file: &PathBuf, reboot: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_reboot(serial: Option<&str>) -> Result<()> {
-    open(serial)?.reboot()?;
-    println!("reboot requested; the probe will re-enumerate");
+fn cmd_reboot(serial: Option<&str>, bootsel: bool) -> Result<()> {
+    if bootsel {
+        open(serial)?.reboot_bootsel()?;
+        println!("BOOTSEL reboot requested; flash with picotool");
+    } else {
+        open(serial)?.reboot()?;
+        println!("reboot requested; the probe will re-enumerate");
+    }
     Ok(())
 }
 

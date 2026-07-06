@@ -248,6 +248,9 @@ async fn main(spawner: Spawner) {
     config.serial_number = Some(serials[0]);
     config.max_power = 100;
     config.max_packet_size_0 = 64;
+    // probe-rs deny-lists VID 2e8a PID 000c with bcdDevice < 2.20 (picoprobe
+    // era debugprobe firmware); claim debugprobe 2.2.0 parity.
+    config.device_release = 0x0220;
 
     static CONFIG_DESC: StaticCell<[u8; 1024]> = StaticCell::new();
     static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
@@ -425,8 +428,14 @@ async fn dap_task(
             if in_ep.write(&response[..len]).await.is_err() {
                 break;
             }
-            if let AfterResponse::Reboot = after {
-                service.reboot().await;
+            match after {
+                AfterResponse::Nothing => {}
+                AfterResponse::Reboot => service.reboot().await,
+                AfterResponse::Bootsel => {
+                    // Give the host time to collect the response first.
+                    embassy_time::Timer::after_millis(100).await;
+                    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+                }
             }
         }
         info!("DAP interface disabled ({})", serial);

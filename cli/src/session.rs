@@ -96,6 +96,13 @@ impl Session {
         check(&resp, CMD_REBOOT)?;
         Ok(())
     }
+
+    /// Reboot the probe into the BOOTSEL bootloader (`CMD_BOOTSEL`).
+    pub fn reboot_bootsel(&self) -> Result<()> {
+        let resp = self.probe.transceive(&[CMD_BOOTSEL])?;
+        check(&resp, CMD_BOOTSEL)?;
+        Ok(())
+    }
 }
 
 /// Human-readable meaning of a protocol status byte.

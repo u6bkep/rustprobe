@@ -13,8 +13,12 @@
 //! picotool discovers the interface by that class triple, which is what the
 //! C multiprobe firmware lacked (BOOTSEL button required to reflash).
 
+use core::cell::RefCell;
+
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::Duration;
-use embassy_usb::control::{OutResponse, Recipient, Request, RequestType};
+use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::driver::Driver;
 use embassy_usb::types::{InterfaceNumber, StringIndex};
 use embassy_usb::{Builder, Handler};
@@ -23,6 +27,32 @@ use crate::vendor::ConfigService;
 
 const RESET_REQUEST_BOOTSEL: u8 = 0x01;
 const RESET_REQUEST_FLASH: u8 = 0x02;
+
+/// TODO(remove-diag): ring of the last few control requests this handler was
+/// offered, readable over the bulk vendor protocol (CMD_CTRL_DIAG) while we
+/// debug why delegated control transfers stall on hardware.
+pub static CTRL_DIAG: Mutex<CriticalSectionRawMutex, RefCell<heapless::Deque<[u8; 8], 6>>> =
+    Mutex::new(RefCell::new(heapless::Deque::new()));
+
+fn record(dir_in: bool, req: &Request) {
+    let entry = [
+        if dir_in { 0x1B } else { 0x0B }, // marker + direction
+        req.request_type as u8,
+        req.recipient as u8,
+        req.request,
+        req.value as u8,
+        (req.value >> 8) as u8,
+        req.index as u8,
+        (req.index >> 8) as u8,
+    ];
+    CTRL_DIAG.lock(|d| {
+        let mut d = d.borrow_mut();
+        if d.is_full() {
+            d.pop_front();
+        }
+        let _ = d.push_back(entry);
+    });
+}
 
 /// Watchdog delay on a reboot-to-application request, so the host sees the
 /// control transfer complete first (pico-sdk uses 100 ms too).
@@ -51,7 +81,14 @@ impl ResetHandler {
 }
 
 impl Handler for ResetHandler {
+    // TODO(remove-diag): record IN requests too, purely for the diag ring.
+    fn control_in<'a>(&'a mut self, req: Request, _buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        record(true, &req);
+        None
+    }
+
     fn control_out(&mut self, req: Request, _data: &[u8]) -> Option<OutResponse> {
+        record(false, &req);
         if req.request_type != RequestType::Vendor
             || req.recipient != Recipient::Interface
             || req.index != u16::from(u8::from(self.itf))

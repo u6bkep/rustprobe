@@ -28,6 +28,13 @@ pub const CMD_SET_TOPOLOGY: u8 = 0x82;
 pub const CMD_COMMIT: u8 = 0x83;
 /// `[CMD_REBOOT]` → `[cmd, status]`, then the probe resets and re-enumerates.
 pub const CMD_REBOOT: u8 = 0x84;
+/// `[CMD_BOOTSEL]` → `[cmd, status]`, then the probe reboots into the
+/// BOOTSEL bootloader (for picotool flashing without the button).
+pub const CMD_BOOTSEL: u8 = 0x85;
+/// `[CMD_CTRL_DIAG]` → `[cmd, status, count, 8-byte entries...]`
+/// TODO(remove-diag): temporary readout of control requests seen by the USB
+/// reset-interface handler, for debugging delegated control transfers.
+pub const CMD_CTRL_DIAG: u8 = 0x86;
 
 /// Command handled successfully.
 pub const STATUS_OK: u8 = 0x00;
