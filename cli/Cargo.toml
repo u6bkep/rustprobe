@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 probe-config = { path = "../probe-config" }
+probe-config-toml = { path = "../probe-config-toml" }
 nusb = "0.1"
 futures-lite = "2"
 clap = { version = "4", features = ["derive"] }

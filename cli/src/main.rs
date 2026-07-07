@@ -4,9 +4,7 @@
 //! vendor-bulk CMSIS-DAP interfaces. See `transport` for the USB layer and
 //! `session` for the protocol framing.
 
-mod board_toml;
 mod session;
-mod topology_toml;
 mod transport;
 
 use std::path::PathBuf;
@@ -16,9 +14,10 @@ use clap::{Parser, Subcommand};
 use probe_config::protocol::FirmwareInfo;
 use probe_config::BoardProfile;
 
-use crate::board_toml::TomlBoardProfile;
+use probe_config_toml::board_toml::{self, TomlBoardProfile};
+use probe_config_toml::topology_toml::TomlTopology;
+
 use crate::session::Session;
-use crate::topology_toml::TomlTopology;
 use crate::transport::Probe;
 
 #[derive(Parser)]

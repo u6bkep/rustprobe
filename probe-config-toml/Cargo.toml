@@ -1,0 +1,12 @@
+[package]
+name = "probe-config-toml"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Human-readable TOML mirrors of the probe-config wire types"
+
+[dependencies]
+probe-config = { path = "../probe-config" }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

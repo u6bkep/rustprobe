@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["probe-config", "autobaud-estimator", "firmware", "cli"]
+members = [
+    "probe-config",
+    "probe-config-toml",
+    "probe-config-wasm",
+    "autobaud-estimator",
+    "firmware",
+    "cli",
+]
 
 [workspace.package]
 edition = "2021"

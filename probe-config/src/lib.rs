@@ -74,7 +74,8 @@ impl UartConfig {
 
 /// Hardware UART instance a GPIO can drive as TX, or `None` if it has no TX
 /// function in the common RP2040/RP2350 pin set. See [`UartConfig::instance`].
-fn uart_tx_instance(pin: u8) -> Option<u8> {
+/// Public so UI frontends can offer only legal pins.
+pub fn uart_tx_instance(pin: u8) -> Option<u8> {
     match pin {
         0 | 12 | 16 | 28 => Some(0),
         4 | 8 | 20 | 24 => Some(1),
@@ -84,7 +85,8 @@ fn uart_tx_instance(pin: u8) -> Option<u8> {
 
 /// Hardware UART instance a GPIO can drive as RX, or `None`. See
 /// [`UartConfig::instance`].
-fn uart_rx_instance(pin: u8) -> Option<u8> {
+/// Public so UI frontends can offer only legal pins.
+pub fn uart_rx_instance(pin: u8) -> Option<u8> {
     match pin {
         1 | 13 | 17 | 29 => Some(0),
         5 | 9 | 21 | 25 => Some(1),
