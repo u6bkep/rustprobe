@@ -37,31 +37,16 @@ jobs:
           cargo build -p rustprobe-firmware --target thumbv8m.main-none-eabihf
           --no-default-features --features rp2350 --release
 
-      - name: Cache picotool
-        id: picotool-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/picotool-install
-          key: picotool-2.2.0-${{ runner.os }}
-
-      - name: Build picotool
-        if: steps.picotool-cache.outputs.cache-hit != 'true'
+      # Prebuilt binary from the pico-sdk-tools releases (no picotool package
+      # exists for the runner's Ubuntu, and building from source needs the SDK).
+      - name: Install picotool
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential pkg-config libusb-1.0-0-dev
-          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk
-          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/picotool
-          cmake -S picotool -B picotool/build \
-            -DPICO_SDK_PATH="$PWD/pico-sdk" \
-            -DCMAKE_INSTALL_PREFIX="$HOME/picotool-install" \
-            -DPICOTOOL_NO_LIBUSB=1
-          cmake --build picotool/build -j"$(nproc)"
-          cmake --install picotool/build
+          curl -sSfL -o picotool.tar.gz https://github.com/raspberrypi/pico-sdk-tools/releases/download/v2.2.0-4/picotool-2.2.0-a4-x86_64-lin.tar.gz
+          tar xzf picotool.tar.gz -C "$HOME"
+          echo "$HOME/picotool" >> "$GITHUB_PATH"
 
       - name: Make UF2s
-        run: |
-          export PATH="$HOME/picotool-install/bin:$PATH"
-          scripts/make-uf2.sh dist-fw
+        run: scripts/make-uf2.sh dist-fw
 
       - name: Install wasm-pack
         run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
@@ -89,9 +74,5 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      # First run enables Pages with the "GitHub Actions" source.
-      - uses: actions/configure-pages@v5
-        with:
-          enablement: true
       - id: deployment
         uses: actions/deploy-pages@v4
