@@ -9,9 +9,15 @@ instead of at compile time.
 | Crate | Purpose |
 |---|---|
 | `probe-config` | `no_std` config schema + validation, shared by firmware and host tools |
+| `probe-config-toml` | TOML mirrors of the wire types, shared by the CLI and web UI |
+| `probe-config-wasm` | wasm-bindgen bindings so the web UI runs the same encode/decode/validation |
 | `autobaud-estimator` | `no_std` baud-rate estimator core (raw edge-timing samples in, baud out), host-testable |
 | `firmware` | embassy-based probe firmware (features: `rp2040` \| `rp2350`) |
 | `cli` | `rustprobe` host CLI: configure the probe over USB (nusb + `probe-config`) |
+
+The `webui/` directory holds a static web UI (vanilla JS + the wasm crate,
+no external dependencies) that does everything the CLI does over WebUSB —
+see below.
 
 Embassy comes from the `computer-whisperer/embassy` fork (`raven_merge6`),
 which carries not-yet-upstreamed fixes we rely on (PIO GPIOBASE window
@@ -72,6 +78,33 @@ reserved = "16"   # WS2812 LED
 `set-board` takes effect immediately for later `set` commits and warns if the
 active topology violates the new profile (the firmware falls back to its
 default topology at the next boot if the stored one no longer validates).
+
+## Web UI
+
+`webui/` is a static single-page app (Chrome/Edge — it needs WebUSB) with
+the CLI's functionality plus a visual topology editor: live pin map, PIO
+SM / USB endpoint budget meters, board-profile editing, presets bundled from
+`configs/`, a local config library (localStorage), TOML import/export, and
+share-by-URL (the config rides in the fragment; nothing touches a server).
+
+It can also flash a bare BOOTSEL-mode board: the page speaks PICOBOOT over
+WebUSB (erase / write / verify / reboot), using either the UF2 baked into the
+deployment or a file you pick, then provisions the fresh probe with a board
+profile and topology in one flow.
+
+```sh
+webui/build.sh                          # wasm-pack + assemble webui/dist
+python3 -m http.server -d webui/dist    # serve locally (WebUSB works on localhost)
+scripts/make-uf2.sh out/                # per-chip + combined UF2s (needs picotool)
+webui/build.sh --firmware out/          # ...bake them into the page
+```
+
+Releases are tag-driven: pushing `v*` runs `.github/workflows/release.yml`,
+which tests, builds both firmwares, publishes the UF2s (per-chip and a
+combined RP2040+RP2350 image — a plain concatenation; each bootrom ignores
+foreign-family blocks) to a GitHub release, and deploys the site to GitHub
+Pages with that firmware baked in. One-time repo setup: Settings → Pages →
+Source: "GitHub Actions".
 
 Topology TOML mirrors the `Topology` type — arrays-of-tables of probes and
 UARTs (`reset` is optional):

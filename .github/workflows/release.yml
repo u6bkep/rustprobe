@@ -1,0 +1,96 @@
+# Tag-triggered release: build both firmwares, publish the UF2s to a GitHub
+# release, and deploy the web UI (with the freshly-built UF2 baked in) to
+# GitHub Pages via the Actions publish source — no gh-pages branch.
+#
+# One-time repo setup: Settings → Pages → Source: "GitHub Actions".
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release
+  pages: write # deploy to Pages
+  id-token: write # deploy-pages OIDC
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        run: rustup target add thumbv6m-none-eabi thumbv8m.main-none-eabihf wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Host tests
+        run: cargo test --workspace --exclude rustprobe-firmware
+
+      - name: Build firmware (RP2040)
+        run: cargo build -p rustprobe-firmware --target thumbv6m-none-eabi --release
+
+      - name: Build firmware (RP2350)
+        run: >
+          cargo build -p rustprobe-firmware --target thumbv8m.main-none-eabihf
+          --no-default-features --features rp2350 --release
+
+      - name: Cache picotool
+        id: picotool-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/picotool-install
+          key: picotool-2.2.0-${{ runner.os }}
+
+      - name: Build picotool
+        if: steps.picotool-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential pkg-config libusb-1.0-0-dev
+          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/picotool
+          cmake -S picotool -B picotool/build \
+            -DPICO_SDK_FETCH_FROM_GIT=1 \
+            -DCMAKE_INSTALL_PREFIX="$HOME/picotool-install" \
+            -DPICOTOOL_NO_LIBUSB=1
+          cmake --build picotool/build -j"$(nproc)"
+          cmake --install picotool/build
+
+      - name: Make UF2s
+        run: |
+          export PATH="$HOME/picotool-install/bin:$PATH"
+          scripts/make-uf2.sh dist-fw
+
+      - name: Install wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+
+      - name: Assemble site
+        run: >
+          webui/build.sh --firmware dist-fw --version "${{ github.ref_name }}"
+          --repo "https://github.com/${{ github.repository }}"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-fw/*.uf2
+          generate_release_notes: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: webui/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # First run enables Pages with the "GitHub Actions" source.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - id: deployment
+        uses: actions/deploy-pages@v4

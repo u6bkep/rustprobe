@@ -1,0 +1,18 @@
+[package]
+name = "probe-config-wasm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "wasm-bindgen bindings exposing probe-config encode/decode/validation to the web UI"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+probe-config = { path = "../probe-config" }
+probe-config-toml = { path = "../probe-config-toml" }
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+wasm-bindgen = "0.2"

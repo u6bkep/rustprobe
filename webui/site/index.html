@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rustprobe</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦀</text></svg>">
+</head>
+<body>
+<header>
+  <h1>rustprobe</h1>
+  <span class="tagline">multi-probe configurator</span>
+  <span id="usb-support" class="pill warn hidden">WebUSB unavailable — use Chrome or Edge</span>
+</header>
+
+<nav id="tabs">
+  <button data-tab="device" class="active">Device</button>
+  <button data-tab="configure">Configure</button>
+  <button data-tab="board">Board</button>
+  <button data-tab="flash">Flash</button>
+</nav>
+
+<main>
+
+<!-- ======================= Device ======================= -->
+<section id="tab-device" class="tab active">
+  <div class="row">
+    <button id="btn-connect" class="primary">Connect probe</button>
+    <button id="btn-refresh" disabled>Refresh</button>
+    <button id="btn-reboot" disabled>Reboot</button>
+    <button id="btn-bootsel" disabled title="Reboot into the BOOTSEL bootloader for flashing">Reboot to BOOTSEL</button>
+    <button id="btn-disconnect" disabled>Disconnect</button>
+  </div>
+  <div id="fault-banner" class="banner error hidden"></div>
+  <div id="device-none" class="placeholder">
+    No probe connected. Click <b>Connect probe</b> and pick a rustprobe
+    (VID:PID 2E8A:000C). On Linux the CLI's udev rules apply here too.
+  </div>
+  <div id="device-panel" class="hidden">
+    <div class="cols">
+      <div class="card">
+        <h2>Firmware</h2>
+        <table id="info-table"></table>
+      </div>
+      <div class="card">
+        <h2>Active topology</h2>
+        <pre id="active-toml" class="toml"></pre>
+        <div class="row">
+          <button id="btn-edit-active">Open in editor</button>
+          <button id="btn-download-active">Download TOML</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Board profile</h2>
+        <pre id="active-board-toml" class="toml"></pre>
+        <div class="row">
+          <button id="btn-edit-board">Open in board editor</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= Configure ======================= -->
+<section id="tab-configure" class="tab">
+  <div class="cols">
+    <div class="card grow">
+      <h2>Topology <span id="topo-name" class="dim"></span></h2>
+      <div id="validation-banner" class="banner hidden"></div>
+      <div id="probes-list"></div>
+      <div class="row">
+        <button id="btn-add-probe">+ probe</button>
+        <button id="btn-add-uart">+ UART</button>
+      </div>
+      <div id="uarts-list"></div>
+      <h3>Budgets</h3>
+      <div id="budgets"></div>
+      <div class="row apply-row">
+        <button id="btn-apply" class="primary" disabled>Write to probe</button>
+        <label><input type="checkbox" id="apply-reboot" checked> reboot to apply</label>
+        <button id="btn-load-active" disabled title="Replace the editor contents with the probe's active topology">Load from probe</button>
+      </div>
+    </div>
+    <div class="card grow">
+      <h2>Pin map</h2>
+      <div id="pinmap" class="pinmap"></div>
+      <div class="legend" id="pinmap-legend"></div>
+    </div>
+  </div>
+  <div class="cols">
+    <div class="card grow">
+      <h2>Presets &amp; library</h2>
+      <div id="presets-list"></div>
+      <h3>Saved configs</h3>
+      <div id="library-list"></div>
+      <div class="row">
+        <input type="text" id="save-name" placeholder="name">
+        <button id="btn-save-local">Save current</button>
+        <button id="btn-share">Copy share link</button>
+      </div>
+    </div>
+    <div class="card grow">
+      <h2>TOML</h2>
+      <textarea id="toml-box" rows="14" spellcheck="false"></textarea>
+      <div class="row">
+        <button id="btn-toml-load">Load into editor</button>
+        <button id="btn-toml-render">Render from editor</button>
+        <button id="btn-toml-download">Download</button>
+        <label class="file-btn">Import file<input type="file" id="toml-file" accept=".toml" hidden></label>
+      </div>
+      <div id="toml-error" class="banner error hidden"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= Board ======================= -->
+<section id="tab-board" class="tab">
+  <div class="cols">
+    <div class="card grow">
+      <h2>Board profile editor</h2>
+      <p class="dim">Click a pin to cycle: <span class="chip free">assignable</span> →
+        <span class="chip reserved">reserved</span> → <span class="chip absent">absent</span>.
+        Reserved pins exist but belong to the board (LEDs, …); absent pins are not wired out.</p>
+      <div id="board-pinmap" class="pinmap"></div>
+      <div id="board-validation" class="banner hidden"></div>
+      <div class="row">
+        <select id="board-presets"></select>
+        <button id="btn-board-preset">Load preset</button>
+      </div>
+      <div class="row">
+        <button id="btn-board-apply" class="primary" disabled>Write to probe</button>
+        <button id="btn-board-load-active" disabled title="Replace the editor contents with the probe's current board profile">Load from probe</button>
+        <span class="dim">takes effect for future topology writes; stored topology is re-checked at next boot</span>
+      </div>
+      <div class="row">
+        <input type="text" id="board-save-name" placeholder="name">
+        <button id="btn-board-save-local">Save locally</button>
+      </div>
+    </div>
+    <div class="card grow">
+      <h2>Board TOML</h2>
+      <textarea id="board-toml-box" rows="8" spellcheck="false"></textarea>
+      <div class="row">
+        <button id="btn-board-toml-load">Load into editor</button>
+        <button id="btn-board-toml-render">Render from editor</button>
+        <button id="btn-board-toml-download">Download</button>
+        <label class="file-btn">Import file<input type="file" id="board-toml-file" accept=".toml" hidden></label>
+      </div>
+      <div id="board-toml-error" class="banner error hidden"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= Flash ======================= -->
+<section id="tab-flash" class="tab">
+  <div class="card">
+    <h2>Flash firmware</h2>
+    <ol class="wizard">
+      <li>
+        <b>Firmware image</b>
+        <div class="row">
+          <label><input type="radio" name="fw-src" value="baked" id="fw-src-baked"> bundled
+            <span id="baked-info" class="dim">(checking…)</span></label>
+          <label><input type="radio" name="fw-src" value="file" id="fw-src-file"> from file
+            <label class="file-btn">Choose UF2<input type="file" id="fw-file" accept=".uf2" hidden></label>
+            <span id="fw-file-info" class="dim"></span></label>
+        </div>
+      </li>
+      <li>
+        <b>Get the board into BOOTSEL mode</b>
+        <div class="dim">Bare board: hold BOOTSEL while plugging in.
+          Running rustprobe: use <i>Reboot to BOOTSEL</i> on the Device tab.</div>
+        <div class="row">
+          <button id="btn-bootrom-connect" class="primary">Connect BOOTSEL device</button>
+          <span id="bootrom-info" class="dim"></span>
+        </div>
+      </li>
+      <li>
+        <b>Flash</b>
+        <div class="row">
+          <button id="btn-flash" disabled>Flash + verify + reboot</button>
+        </div>
+        <progress id="flash-progress" max="1" value="0" class="hidden"></progress>
+        <div id="flash-status" class="dim"></div>
+      </li>
+      <li>
+        <b>Provision (optional)</b>
+        <div class="dim">After the board reboots as a rustprobe, connect it and apply a board
+          profile and topology from the Configure/Board tabs — or use your last-loaded
+          editor state in one step:</div>
+        <div class="row">
+          <button id="btn-provision">Connect new probe &amp; apply editor config</button>
+          <span id="provision-status" class="dim"></span>
+        </div>
+      </li>
+    </ol>
+  </div>
+</section>
+
+</main>
+
+<details id="console-box">
+  <summary>Protocol console</summary>
+  <pre id="console"></pre>
+</details>
+
+<footer>
+  <span id="version"></span>
+  <a href="https://github.com/" id="repo-link" class="hidden">source</a>
+</footer>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
