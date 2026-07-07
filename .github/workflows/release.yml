@@ -49,9 +49,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential pkg-config libusb-1.0-0-dev
+          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk
           git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/picotool
           cmake -S picotool -B picotool/build \
-            -DPICO_SDK_FETCH_FROM_GIT=1 \
+            -DPICO_SDK_PATH="$PWD/pico-sdk" \
             -DCMAKE_INSTALL_PREFIX="$HOME/picotool-install" \
             -DPICOTOOL_NO_LIBUSB=1
           cmake --build picotool/build -j"$(nproc)"
