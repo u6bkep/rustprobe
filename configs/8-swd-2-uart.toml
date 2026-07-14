@@ -1,0 +1,41 @@
+[[probes]]
+swclk = 0
+swdio = 1
+
+[[probes]]
+swclk = 2
+swdio = 3
+
+[[probes]]
+swclk = 6
+swdio = 7
+
+[[probes]]
+swclk = 8
+swdio = 9
+
+[[probes]]
+swclk = 10
+swdio = 11
+
+[[probes]]
+swclk = 12
+swdio = 13
+
+[[probes]]
+swclk = 14
+swdio = 15
+
+[[probes]]
+swclk = 26
+swdio = 27
+
+[[uarts]]
+tx = 28
+rx = 29
+baud = 115200
+
+[[uarts]]
+tx = 4
+rx = 5
+baud = 115200

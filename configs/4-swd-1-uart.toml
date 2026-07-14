@@ -1,0 +1,20 @@
+[[probes]]
+swclk = 0
+swdio = 1
+
+[[probes]]
+swclk = 2
+swdio = 3
+
+[[probes]]
+swclk = 4
+swdio = 5
+
+[[probes]]
+swclk = 6
+swdio = 7
+
+[[uarts]]
+tx = 20
+rx = 21
+baud = 115200
