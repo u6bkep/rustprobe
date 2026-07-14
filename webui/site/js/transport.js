@@ -13,17 +13,25 @@ export function webusbAvailable() {
   return typeof navigator !== "undefined" && !!navigator.usb;
 }
 
+/// Group devices by identity (vid:pid:serial). Chrome sometimes keeps a
+/// stale entry for a replugged device (open() fails "Access denied"), so a
+/// physical device can appear twice; render one row per group and try each
+/// entry when connecting.
+export function dedupeDevices(devices) {
+  const groups = new Map();
+  for (const d of devices) {
+    const key = `${d.vendorId}:${d.productId}:${d.serialNumber ?? ""}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(d);
+  }
+  return [...groups.values()];
+}
+
 /// Prompt the user to pick a rustprobe. Must be called from a user gesture.
 export async function requestProbe() {
   return navigator.usb.requestDevice({
     filters: [{ vendorId: VID, productId: PID }],
   });
-}
-
-/// Previously-authorized rustprobes (no prompt needed).
-export async function authorizedProbes() {
-  const devices = await navigator.usb.getDevices();
-  return devices.filter((d) => d.vendorId === VID && d.productId === PID);
 }
 
 function isDapInterface(iface) {

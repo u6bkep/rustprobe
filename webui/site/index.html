@@ -26,16 +26,20 @@
 <!-- ======================= Device ======================= -->
 <section id="tab-device" class="tab active">
   <div class="row">
-    <button id="btn-connect" class="primary">Connect probe</button>
+    <button id="btn-connect" class="primary" title="Grant this page access to a probe or BOOTSEL-mode board via the browser chooser">Pair device…</button>
     <button id="btn-refresh" disabled>Refresh</button>
     <button id="btn-reboot" disabled>Reboot</button>
     <button id="btn-bootsel" disabled title="Reboot into the BOOTSEL bootloader for flashing">Reboot to BOOTSEL</button>
     <button id="btn-disconnect" disabled>Disconnect</button>
   </div>
+  <div id="bootsel-hint" class="banner warn hidden"></div>
   <div id="fault-banner" class="banner error hidden"></div>
+  <div id="probe-list" class="device-list"></div>
   <div id="device-none" class="placeholder">
-    No probe connected. Click <b>Connect probe</b> and pick a rustprobe
-    (VID:PID 2E8A:000C). On Linux the CLI's udev rules apply here too.
+    No paired probes. Click <b>Pair device…</b> and pick a rustprobe
+    (VID:PID 2E8A:000C) or a BOOTSEL-mode board in the browser chooser —
+    paired probes appear here afterwards. On Linux the CLI's udev rules
+    apply here too.
   </div>
   <div id="device-panel" class="hidden">
     <div class="cols">
@@ -171,8 +175,9 @@
         <b>Get the board into BOOTSEL mode</b>
         <div class="dim">Bare board: hold BOOTSEL while plugging in.
           Running rustprobe: use <i>Reboot to BOOTSEL</i> on the Device tab.</div>
+        <div id="bootrom-list" class="device-list"></div>
         <div class="row">
-          <button id="btn-bootrom-connect" class="primary">Connect BOOTSEL device</button>
+          <button id="btn-bootrom-connect" class="primary" title="Grant this page access to a BOOTSEL-mode device via the browser chooser">Pair BOOTSEL device…</button>
           <span id="bootrom-info" class="dim"></span>
         </div>
       </li>

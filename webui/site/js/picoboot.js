@@ -51,13 +51,19 @@ const STATUS_NAMES = [
   "not found", "unsupported modification",
 ];
 
+/// WebUSB requestDevice filters matching BOOTSEL-mode devices.
+export const BOOTROM_FILTERS = Object.keys(BOOTROM_PIDS).map((pid) => ({
+  vendorId: 0x2e8a, productId: Number(pid),
+}));
+
 /// Prompt for a BOOTSEL-mode device. Must be called from a user gesture.
 export async function requestBootromDevice() {
-  return navigator.usb.requestDevice({
-    filters: Object.keys(BOOTROM_PIDS).map((pid) => ({
-      vendorId: 0x2e8a, productId: Number(pid),
-    })),
-  });
+  return navigator.usb.requestDevice({ filters: BOOTROM_FILTERS });
+}
+
+/// True if `device` is a bootrom (BOOTSEL-mode) device.
+export function isBootromDevice(device) {
+  return device.vendorId === 0x2e8a && device.productId in BOOTROM_PIDS;
 }
 
 export class Picoboot {

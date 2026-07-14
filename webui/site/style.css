@@ -88,6 +88,12 @@ table td:first-child { color: var(--dim); }
 .dim { color: var(--dim); font-size: .85rem; }
 .pill { border-radius: 999px; padding: .15rem .7rem; font-size: .8rem; }
 .pill.warn { background: var(--warn); color: #000; }
+.pill.ok { background: var(--ok); color: #000; }
+
+/* --- paired-device lists --- */
+.device-list { max-width: 40rem; }
+.device-list .preset-row button { margin-left: auto; }
+.device-list .pill { margin-left: auto; }
 
 /* --- pin map --- */
 .pinmap {

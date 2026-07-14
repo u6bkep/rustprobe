@@ -2,7 +2,8 @@
 // manifest, share-link intake, protocol console.
 
 import init, * as wasm from "../pkg/probe_config_wasm.js";
-import { webusbAvailable, requestProbe, authorizedProbes, openProbe } from "./transport.js";
+import { webusbAvailable, openProbe, dedupeDevices, VID, PID } from "./transport.js";
+import { isBootromDevice, BOOTROM_FILTERS } from "./picoboot.js";
 import { Session } from "./session.js";
 import { initEditor, download } from "./editor.js";
 import { initBoard } from "./board.js";
@@ -22,6 +23,7 @@ const app = {
   wasm: null,
   session: null,
   transport: null,
+  pairedProbes: [], // authorized + attached rustprobes, deduped: one entry-group per device
   info: null,
   profile: null, // device's board profile
   presets: { topologies: [], boards: [], firmware: null },
@@ -72,9 +74,24 @@ const app = {
     this.info = null;
     this.profile = null;
     renderDevice(null);
+    renderProbeList();
     if (reason) this.log(reason);
     this.renderEditor?.();
     this.renderBoard?.();
+  },
+
+  /// Re-enumerate paired-and-attached devices, then re-render the device
+  /// lists: paired probes (device tab), BOOTSEL hint, bootrom list (flash
+  /// tab). The chooser prompt is only ever needed for a first-time grant.
+  async refreshUsbLists() {
+    if (!webusbAvailable()) return;
+    const devices = await navigator.usb.getDevices();
+    this.pairedProbes =
+      dedupeDevices(devices.filter((d) => d.vendorId === VID && d.productId === PID));
+    const bootroms = dedupeDevices(devices.filter(isBootromDevice));
+    renderProbeList();
+    renderBootromHint(bootroms);
+    this.renderBootromList?.(bootroms);
   },
 };
 
@@ -93,7 +110,7 @@ document.querySelectorAll("nav#tabs button").forEach((btn) => {
 
 function renderDevice(topo) {
   const connected = !!app.session;
-  $("device-none").classList.toggle("hidden", connected);
+  $("device-none").classList.toggle("hidden", connected || app.pairedProbes.length > 0);
   $("device-panel").classList.toggle("hidden", !connected);
   for (const id of ["btn-refresh", "btn-reboot", "btn-bootsel", "btn-disconnect"]) {
     $(id).disabled = !connected;
@@ -132,27 +149,100 @@ function renderDevice(topo) {
   app.activeTopo = topo;
 }
 
-async function connect(device) {
-  try {
-    app.transport = await openProbe(device, app.log);
-    app.session = new Session(app.transport, app.wasm);
-    device.addEventListener?.("disconnect", () => app.disconnect("probe disconnected"));
-    await app.refreshDevice();
-    app.log(`connected to ${device.serialNumber ?? "probe"}`);
-  } catch (e) {
-    await app.disconnect();
-    app.log(`connect failed: ${e.message}`);
-    alert(`connect failed: ${e.message}`);
+/// List every paired-and-attached probe with a per-device Connect button;
+/// the chooser (btn-connect) is only needed to authorize a new one.
+function renderProbeList() {
+  const list = $("probe-list");
+  list.textContent = "";
+  for (const group of app.pairedProbes) {
+    const row = document.createElement("div");
+    row.className = "preset-row";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = group[0].serialNumber ?? "(no serial)";
+    const kind = document.createElement("span");
+    kind.className = "kind";
+    kind.textContent = group[0].productName ?? "";
+    row.append(name, kind);
+    if (group.includes(app.transport?.device)) {
+      const pill = document.createElement("span");
+      pill.className = "pill ok";
+      pill.textContent = "connected";
+      row.append(pill);
+    } else {
+      const btn = document.createElement("button");
+      btn.textContent = "Connect";
+      btn.addEventListener("click", async () => {
+        await app.disconnect();
+        await connect(group);
+      });
+      row.append(btn);
+    }
+    list.append(row);
   }
+  $("device-none").classList.toggle("hidden", !!app.session || app.pairedProbes.length > 0);
+}
+
+/// Point at the Flash tab when a paired BOOTSEL-mode device is attached —
+/// it never shows up in the probe list or chooser on this tab.
+function renderBootromHint(bootroms) {
+  const el = $("bootsel-hint");
+  el.classList.toggle("hidden", bootroms.length === 0);
+  if (bootroms.length === 0) return;
+  el.textContent = `${bootroms.length > 1 ? `${bootroms.length} BOOTSEL-mode devices are` : "A BOOTSEL-mode device is"} attached — flash it from the `;
+  const link = document.createElement("a");
+  link.href = "#";
+  link.textContent = "Flash tab";
+  link.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    document.querySelector('nav#tabs button[data-tab="flash"]').click();
+  });
+  el.append(link, ".");
+}
+
+/// Connect to a probe. `devices` is one device or a dedup group — stale
+/// Chrome entries fail open() with "Access denied", so try each in turn.
+async function connect(devices) {
+  let lastErr;
+  for (const device of [].concat(devices)) {
+    try {
+      app.transport = await openProbe(device, app.log);
+      app.session = new Session(app.transport, app.wasm);
+      device.addEventListener?.("disconnect", () => app.disconnect("probe disconnected"));
+      await app.refreshDevice();
+      app.log(`connected to ${device.serialNumber ?? "probe"}`);
+      renderProbeList();
+      return;
+    } catch (e) {
+      lastErr = e;
+      await app.disconnect();
+    }
+  }
+  app.log(`connect failed: ${lastErr.message}`);
+  alert(`connect failed: ${lastErr.message}`);
+  renderProbeList();
 }
 
 $("btn-connect").addEventListener("click", async () => {
+  let device;
   try {
-    await app.disconnect();
-    await connect(await requestProbe());
+    // Offer BOOTSEL-mode devices too: they need pairing just the same, and
+    // users land here first when their board is in the bootloader.
+    device = await navigator.usb.requestDevice({
+      filters: [{ vendorId: VID, productId: PID }, ...BOOTROM_FILTERS],
+    });
   } catch {
-    /* user cancelled the picker */
+    return; /* user cancelled the picker */
   }
+  if (isBootromDevice(device)) {
+    app.log(`paired BOOTSEL device (${device.productName ?? "RP2 Boot"})`);
+    await app.refreshUsbLists();
+    document.querySelector('nav#tabs button[data-tab="flash"]').click();
+    return;
+  }
+  await app.disconnect();
+  await connect(device);
+  await app.refreshUsbLists();
 });
 $("btn-refresh").addEventListener("click", () => app.refreshDevice().catch((e) => alert(e.message)));
 $("btn-disconnect").addEventListener("click", () => app.disconnect("disconnected"));
@@ -186,12 +276,14 @@ $("btn-edit-board").addEventListener("click", () => {
   document.querySelector('nav#tabs button[data-tab="board"]').click();
 });
 
-// USB disconnect events at the bus level.
+// USB plug/unplug events at the bus level (paired devices only).
 if (webusbAvailable()) {
-  navigator.usb.addEventListener("disconnect", (ev) => {
+  navigator.usb.addEventListener("connect", () => app.refreshUsbLists());
+  navigator.usb.addEventListener("disconnect", async (ev) => {
     if (app.transport && ev.device === app.transport.device) {
-      app.disconnect("probe disconnected");
+      await app.disconnect("probe disconnected");
     }
+    app.refreshUsbLists();
   });
 }
 
@@ -251,10 +343,11 @@ async function main() {
     history.replaceState(null, "", location.pathname + location.search);
   }
 
-  // Reconnect a previously-authorized probe without prompting.
+  // Populate the paired-device lists; reconnect without prompting when
+  // exactly one probe is known (several: the user picks from the list).
   if (webusbAvailable()) {
-    const known = await authorizedProbes();
-    if (known.length === 1) await connect(known[0]);
+    await app.refreshUsbLists();
+    if (app.pairedProbes.length === 1) await connect(app.pairedProbes[0]);
   }
 }
 

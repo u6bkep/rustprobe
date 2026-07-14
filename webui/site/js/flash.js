@@ -3,7 +3,7 @@
 // topology.
 
 import { parseUf2, filterFamily, familiesIn, familyName, coalesce } from "./uf2.js";
-import { requestBootromDevice, Picoboot, CHIP_FAMILY } from "./picoboot.js";
+import { requestBootromDevice, Picoboot, CHIP_FAMILY, BOOTROM_PIDS } from "./picoboot.js";
 import { requestProbe, openProbe } from "./transport.js";
 import { Session } from "./session.js";
 
@@ -60,20 +60,85 @@ export function initFlash(app) {
 
   // ---- bootrom connection --------------------------------------------
 
-  $("btn-bootrom-connect").addEventListener("click", async () => {
-    try {
-      if (boot) { await boot.close(); boot = null; }
-      const device = await requestBootromDevice();
-      boot = new Picoboot(device, app.log);
-      await boot.open();
-      $("bootrom-info").textContent = `connected: ${boot.chip.toUpperCase()} bootrom`;
-      $("btn-flash").disabled = false;
-    } catch (e) {
-      boot = null;
-      $("bootrom-info").textContent = e.message;
-      $("btn-flash").disabled = true;
+  let bootromDevices = []; // paired + attached dedup groups, pushed by app.refreshUsbLists
+
+  /// Connect to a BOOTSEL device. `devices` is one device or a dedup group —
+  /// stale Chrome entries fail open() with "Access denied", so try each.
+  async function connectBootrom(devices) {
+    if (boot) { await boot.close(); boot = null; }
+    let lastErr;
+    for (const device of [].concat(devices)) {
+      try {
+        const b = new Picoboot(device, app.log);
+        await b.open();
+        boot = b;
+        break;
+      } catch (e) {
+        lastErr = e;
+      }
     }
+    $("bootrom-info").textContent =
+      boot ? `connected: ${boot.chip.toUpperCase()} bootrom` : lastErr.message;
+    $("btn-flash").disabled = !boot;
+    renderBootromList();
+  }
+
+  /// Paired-and-attached BOOTSEL devices, one Connect button each; the
+  /// chooser (btn-bootrom-connect) is only needed for a first-time grant.
+  function renderBootromList() {
+    const list = $("bootrom-list");
+    list.textContent = "";
+    for (const group of bootromDevices) {
+      const row = document.createElement("div");
+      row.className = "preset-row";
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = group[0].productName ?? "RP2 Boot";
+      const kind = document.createElement("span");
+      kind.className = "kind";
+      kind.textContent = BOOTROM_PIDS[group[0].productId]?.toUpperCase() ?? "";
+      row.append(name, kind);
+      if (group.includes(boot?.device)) {
+        const pill = document.createElement("span");
+        pill.className = "pill ok";
+        pill.textContent = "connected";
+        row.append(pill);
+      } else {
+        const btn = document.createElement("button");
+        btn.textContent = "Connect";
+        btn.addEventListener("click", () => connectBootrom(group));
+        row.append(btn);
+      }
+      list.append(row);
+    }
+  }
+
+  app.renderBootromList = (devices) => {
+    bootromDevices = devices;
+    renderBootromList();
+  };
+
+  $("btn-bootrom-connect").addEventListener("click", async () => {
+    let device;
+    try {
+      device = await requestBootromDevice();
+    } catch {
+      return; // user cancelled the picker
+    }
+    await connectBootrom(device);
+    app.refreshUsbLists();
   });
+
+  // The connected bootrom drops off the bus when it reboots or is unplugged.
+  if (navigator.usb) {
+    navigator.usb.addEventListener("disconnect", (ev) => {
+      if (boot && ev.device === boot.device) {
+        boot = null;
+        $("btn-flash").disabled = true;
+        $("bootrom-info").textContent = "";
+      }
+    });
+  }
 
   // ---- flash ----------------------------------------------------------
 
@@ -103,6 +168,7 @@ export function initFlash(app) {
       await boot.close();
       boot = null;
       $("bootrom-info").textContent = "";
+      renderBootromList();
     } catch (e) {
       status(`failed: ${e.message}`);
       app.log(`flash failed: ${e.message}`);
