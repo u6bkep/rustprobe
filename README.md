@@ -173,8 +173,17 @@ GPIO via PIO input without disturbing the UART's ownership of the pin. See
 `firmware/src/autobaud.rs`.
 
 Not yet: host-driven UART break (embassy's `CdcAcmClass` doesn't surface CDC
-`SEND_BREAK` — `TODO(break)`), RP2350-only alternate UART pins, LEDs. The
-issue-#3 wedge fix (core-0 endpoint I/O + core-1 SWD workers) compiles for
-both chips but has not yet been re-validated on hardware, and the deep-wedge
-half of that issue (abandoned EP0 control transfer parks `usb_task`) needs
-the embassy-fork fix, not just this firmware.
+`SEND_BREAK` — `TODO(break)`), RP2350-only alternate UART pins, LEDs.
+`probe-rs info` against this firmware always fails: probe-rs's espressif
+chip detection JTAG-scans first, and dap-rs answers `DAP_JtagSequence` with
+OK-but-no-capture-data even though JTAG is reported unavailable (it should
+return DAP_ERROR so hosts skip JTAG); `probe-rs run`/`attach` are
+unaffected.
+
+Multi-instance hardware validation (Aug 2026, 9-probe RP2350 LA fixture,
+issue #3): 7 concurrent `probe-rs run` flash+RTT sessions at 100 kHz SWD ran
+to completion, the full `pad_selftest` fleet harness passed 14/14 sessions,
+and a 5× `USBDEVFS_RESET` storm fired mid-traffic recovered without a power
+cycle (the pre-fix firmware deep-wedged, POR-only). Most of the session
+failures originally attributed to probe wedging were the harness's 60 s idle
+timeout killing slow 7-way 100 kHz flashes — see issue #3 for the split.
