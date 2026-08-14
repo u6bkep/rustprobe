@@ -1,9 +1,24 @@
 //! Rustprobe firmware: N SWD probes over CMSIS-DAP v2, topology read from
 //! flash at boot.
 //!
-//! Core 0 runs USB (and, later, the UART bridges); core 1 runs all DAP
-//! tasks. Config changes arrive as vendor commands (staged → commit →
-//! reboot); see `probe_config::protocol`.
+//! Core 0 runs USB — the device task, all DAP endpoint I/O, and the UART
+//! bridges. Core 1 runs only the SWD execution workers, one per probe,
+//! fed over per-probe request/response channels. Two invariants hang off
+//! this split (see issue #3, the concurrent-open wedge):
+//!
+//! * Core 1 may busy-spin for milliseconds per DAP command (the PIO waits
+//!   in `swd.rs` are blocking), so nothing latency-sensitive lives there.
+//!   Commands that touch no probe hardware — the `DAP_Info` family and the
+//!   rustprobe config vendor commands — are answered directly on core 0,
+//!   so interface opens (probe-rs sends `DAP_Info` with a 50 ms timeout)
+//!   never wait behind other probes' wire traffic.
+//! * Every USB endpoint register is touched from core 0 only. The
+//!   embassy-rp USB driver's buffer-control write protocol assumes all
+//!   writers share one execution context; endpoint futures on core 1
+//!   would race the control-path (SET_CONFIGURATION/SET_INTERFACE) writes.
+//!
+//! Config changes arrive as vendor commands (staged → commit → reboot);
+//! see `probe_config::protocol`.
 
 #![no_std]
 #![no_main]
@@ -26,6 +41,8 @@ use embassy_rp::uart;
 use embassy_rp::usb::{Driver, Endpoint, In, InterruptHandler, Out};
 use embassy_rp::watchdog::Watchdog;
 use embassy_rp::{bind_interrupts, pio};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_usb::class::cdc_acm;
 use embassy_usb::driver::{Endpoint as _, EndpointIn, EndpointOut};
 use embassy_usb::msos::{self, windows_version};
@@ -92,6 +109,10 @@ fn default_topology() -> Topology {
 
 /// CMSIS-DAP packet size (bulk full-speed MPS).
 const DAP_PACKET_SIZE: u16 = 64;
+
+/// CMSIS-DAP firmware version reported by `DAP_Info`; passed to dap-rs and
+/// mirrored by the core-0 fast path (`dap_info_response`).
+const DAP_FW_VERSION: &str = "2.1.0";
 
 const DAP_INTERFACE_STRING: &str = "CMSIS-DAP v2 Interface";
 
@@ -329,29 +350,34 @@ async fn main(spawner: Spawner) {
 
     let usb = builder.build();
 
-    // --- DAP handlers, executed on core 1 ----------------------------------
-    let mut daps: Vec<(DapHandler, Endpoint<'static, USB, Out>, Endpoint<'static, USB, In>, &'static str), MAX_PROBES> =
-        Vec::new();
-    for (i, (engine, (out_ep, in_ep))) in engines.into_iter().zip(endpoints).enumerate() {
+    // --- SWD workers (core 1) and DAP endpoint I/O tasks (core 0) ----------
+    // The worker owns the dap-rs handler (and with it the PIO engine); the
+    // I/O task owns the USB endpoints. They meet at WORKER_REQ/WORKER_RESP.
+    let mut workers: Vec<DapHandler, MAX_PROBES> = Vec::new();
+    for engine in engines {
         let dap: DapHandler = dap_rs::dap::Dap::new(
             ProbeContext::new(engine),
             NoLeds,
             embassy_time::Delay,
             dap_rs::swo::NoSwo,
-            "2.1.0",
+            DAP_FW_VERSION,
             DAP_PACKET_SIZE,
         );
-        daps.push((dap, out_ep, in_ep, serials[i])).ok().unwrap();
+        workers.push(dap).ok().unwrap();
     }
 
     spawn_core1(p.CORE1, CORE1_STACK.init(Stack::new()), move || {
         let executor1 = EXECUTOR1.init(Executor::new());
         executor1.run(|spawner1| {
-            for (dap, out_ep, in_ep, serial) in daps {
-                spawner1.spawn(dap_task(dap, out_ep, in_ep, serial, service).unwrap());
+            for (i, dap) in workers.into_iter().enumerate() {
+                spawner1.spawn(swd_worker(dap, i).unwrap());
             }
         })
     });
+
+    for (i, (out_ep, in_ep)) in endpoints.into_iter().enumerate() {
+        spawner.spawn(dap_io_task(i, out_ep, in_ep, serials[i], service).unwrap());
+    }
 
     // --- CDC-UART bridges, executed on core 0 (this executor) --------------
     // Each bridge pairs the CDC class built above (in UART order) with a
@@ -409,14 +435,63 @@ async fn usb_task(mut usb: UsbDevice<'static, Driver<'static, USB>>) -> ! {
     usb.run().await
 }
 
+/// One in-flight DAP packet, shipped between a core-0 I/O task and its
+/// core-1 SWD worker.
+struct DapPacket {
+    len: u8,
+    buf: [u8; DAP_PACKET_SIZE as usize],
+}
+
+/// Request to a core-1 SWD worker.
+enum WorkerRequest {
+    /// Run one CMSIS-DAP command; the worker sends one `DapPacket` back on
+    /// `WORKER_RESP` (len 0 = no response, e.g. `DAP_TransferAbort`).
+    Process(DapPacket),
+    /// The interface went down: `Dap::suspend` (park SWDIO, release nRESET).
+    /// No response.
+    Suspend,
+}
+
+/// Per-probe channels between I/O task (core 0) and SWD worker (core 1).
+/// Depth 1: CMSIS-DAP is strictly request/response per interface, and the
+/// I/O task always collects the response before sending anything else, so
+/// a `Suspend` behind an abandoned `Process` is the deepest it ever gets.
+static WORKER_REQ: [Channel<CriticalSectionRawMutex, WorkerRequest, 1>; MAX_PROBES] =
+    [const { Channel::new() }; MAX_PROBES];
+static WORKER_RESP: [Channel<CriticalSectionRawMutex, DapPacket, 1>; MAX_PROBES] =
+    [const { Channel::new() }; MAX_PROBES];
+
+/// SWD execution worker: the only code that touches this probe's PIO engine.
+/// Runs on core 1, where `process_command`'s blocking PIO waits can spin
+/// without stalling USB.
 #[embassy_executor::task(pool_size = MAX_PROBES)]
-async fn dap_task(
-    mut dap: DapHandler,
+async fn swd_worker(mut dap: DapHandler, idx: usize) -> ! {
+    loop {
+        match WORKER_REQ[idx].receive().await {
+            WorkerRequest::Suspend => dap.suspend(),
+            WorkerRequest::Process(req) => {
+                let mut resp = DapPacket { len: 0, buf: [0; DAP_PACKET_SIZE as usize] };
+                let len = dap.process_command(&req.buf[..req.len as usize], &mut resp.buf);
+                resp.len = len as u8;
+                WORKER_RESP[idx].send(resp).await;
+            }
+        }
+    }
+}
+
+/// DAP endpoint I/O for one probe interface. Runs on core 0 so endpoint
+/// registers are never touched from core 1 and so `DAP_Info` / config
+/// vendor commands are answered at USB latency regardless of what the SWD
+/// workers are doing (see module docs).
+#[embassy_executor::task(pool_size = MAX_PROBES)]
+async fn dap_io_task(
+    idx: usize,
     mut out_ep: Endpoint<'static, USB, Out>,
     mut in_ep: Endpoint<'static, USB, In>,
     serial: &'static str,
     service: &'static ConfigService,
 ) -> ! {
+    const DAP_INFO: u8 = 0x00;
     let mut request = [0u8; DAP_PACKET_SIZE as usize];
     let mut response = [0u8; DAP_PACKET_SIZE as usize];
     loop {
@@ -431,7 +506,25 @@ async fn dap_task(
                 continue;
             }
 
-            let (len, after) = process_request(&mut dap, &request[..n], &mut response, serial, service).await;
+            let (len, after) = match request[0] {
+                DAP_INFO => (
+                    dap_info_response(&request[..n], serial, &mut response),
+                    AfterResponse::Nothing,
+                ),
+                cmd if (VENDOR_BASE..=VENDOR_END).contains(&cmd) => {
+                    service.handle(&request[..n], &mut response).await
+                }
+                _ => {
+                    let mut req = DapPacket { len: n as u8, buf: [0; DAP_PACKET_SIZE as usize] };
+                    req.buf[..n].copy_from_slice(&request[..n]);
+                    WORKER_REQ[idx].send(WorkerRequest::Process(req)).await;
+                    // Always collect the response, even if the endpoint dies
+                    // meanwhile, so the channels never go out of step.
+                    let resp = WORKER_RESP[idx].receive().await;
+                    response[..resp.len as usize].copy_from_slice(&resp.buf[..resp.len as usize]);
+                    (resp.len as usize, AfterResponse::Nothing)
+                }
+            };
             if len == 0 {
                 continue; // e.g. DAP_TransferAbort: no response
             }
@@ -449,35 +542,72 @@ async fn dap_task(
             }
         }
         info!("DAP interface disabled ({})", serial);
-        dap.suspend();
+        WORKER_REQ[idx].send(WorkerRequest::Suspend).await;
     }
 }
 
-/// Dispatch one CMSIS-DAP request, handling what dap-rs doesn't: the
-/// serial-number info request and the rustprobe config vendor commands.
-async fn process_request(
-    dap: &mut DapHandler,
-    request: &[u8],
-    response: &mut [u8],
-    serial: &'static str,
-    service: &'static ConfigService,
-) -> (usize, AfterResponse) {
+/// Answer a `DAP_Info` request on core 0, byte-identical to what dap-rs's
+/// `process_info` would produce for this firmware's fixed configuration
+/// (SWD-only capabilities, `NoSwo`, no test-domain timer, 64-byte packets)
+/// — except for the serial number, where dap-rs returns an empty string and
+/// we return the per-instance serial that lets hosts tell multiprobe
+/// instances apart. Returns the response length.
+fn dap_info_response(request: &[u8], serial: &str, response: &mut [u8]) -> usize {
     const DAP_INFO: u8 = 0x00;
-    const DAP_INFO_SERIAL: u8 = 0x03;
-    match *request {
-        [DAP_INFO, DAP_INFO_SERIAL, ..] => {
-            // dap-rs answers this with an empty string; the per-instance
-            // serial is how hosts tell multiprobe instances apart.
+    const ID_SERIAL: u8 = 0x03;
+    const ID_FW_VERSION: u8 = 0x04;
+    const ID_CAPABILITIES: u8 = 0xF0;
+    const ID_SWO_BUFFER_SIZE: u8 = 0xFD;
+    const ID_MAX_PACKET_COUNT: u8 = 0xFE;
+    const ID_MAX_PACKET_SIZE: u8 = 0xFF;
+    // dap-rs capabilities byte: bit 0 (SWD) only. JTAG is reported
+    // unavailable (`ProbeJtag::available` is false), `NoSwo` supports
+    // nothing, and `Dependencies::timer_available` is left at its false
+    // default. Revisit if any of those change.
+    const CAPABILITIES: u8 = 0x01;
+
+    response[0] = DAP_INFO;
+    match request.get(1) {
+        Some(&ID_SERIAL) => {
             let bytes = serial.as_bytes();
-            response[0] = DAP_INFO;
             response[1] = bytes.len() as u8 + 1; // include NUL
             response[2..2 + bytes.len()].copy_from_slice(bytes);
             response[2 + bytes.len()] = 0;
-            (bytes.len() + 3, AfterResponse::Nothing)
+            bytes.len() + 3
         }
-        [cmd, ..] if (VENDOR_BASE..=VENDOR_END).contains(&cmd) => {
-            service.handle(request, response).await
+        Some(&ID_FW_VERSION) => {
+            let bytes = DAP_FW_VERSION.as_bytes();
+            response[1] = bytes.len() as u8;
+            response[2..2 + bytes.len()].copy_from_slice(bytes);
+            bytes.len() + 2
         }
-        _ => (dap.process_command(request, response), AfterResponse::Nothing),
+        Some(&ID_CAPABILITIES) => {
+            response[1] = 1;
+            response[2] = CAPABILITIES;
+            3
+        }
+        Some(&ID_SWO_BUFFER_SIZE) => {
+            // NoSwo: zero-byte buffer.
+            response[1] = 4;
+            response[2..6].copy_from_slice(&0u32.to_le_bytes());
+            6
+        }
+        Some(&ID_MAX_PACKET_COUNT) => {
+            // One packet at a time, matching dap-rs.
+            response[1] = 1;
+            response[2] = 1;
+            3
+        }
+        Some(&ID_MAX_PACKET_SIZE) => {
+            response[1] = 2;
+            response[2..4].copy_from_slice(&DAP_PACKET_SIZE.to_le_bytes());
+            4
+        }
+        // Everything else (vendor/product/target strings, test-domain
+        // timer, unknown ids, missing id byte): zero-length value.
+        _ => {
+            response[1] = 0;
+            2
+        }
     }
 }

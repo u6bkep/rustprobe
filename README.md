@@ -127,9 +127,14 @@ Multi-instance topology read from flash at boot (falling back to the stock
 debugprobe pico config: SWD probe SWCLK=GP2/SWDIO=GP3/nRESET=GP1 plus a
 CDC-UART bridge on TX=GP4/RX=GP5 @ 115200). CMSIS-DAP v2 per probe over a
 vendor bulk interface, WinUSB descriptors, per-instance serial `<uid>:<n>`,
-config vendor commands + host CLI, core-1 execution of the DAP tasks. The SWD
-wire engine is the C firmware's `probe.pio` command FIFO program driven
-through dap-rs's `Swd`/`Dependencies` traits.
+config vendor commands + host CLI. DAP endpoint I/O runs on core 0 next to
+the USB device task (all endpoint registers are touched from one core, and
+`DAP_Info`/config vendor commands are answered at USB latency); the SWD
+execution workers run on core 1 behind per-probe request/response channels,
+where their blocking PIO waits can spin without stalling USB or other
+probes' interface opens (see issue #3). The SWD wire engine is the C
+firmware's `probe.pio` command FIFO program driven through dap-rs's
+`Swd`/`Dependencies` traits.
 
 Hardware-validated on an RP2040 Pico (July 2026): probe-rs walks a Pico 2 W's
 CoreSight topology and sustains ~110 KB/s verified RAM read/write at 3 MHz
@@ -168,4 +173,8 @@ GPIO via PIO input without disturbing the UART's ownership of the pin. See
 `firmware/src/autobaud.rs`.
 
 Not yet: host-driven UART break (embassy's `CdcAcmClass` doesn't surface CDC
-`SEND_BREAK` — `TODO(break)`), RP2350-only alternate UART pins, LEDs.
+`SEND_BREAK` — `TODO(break)`), RP2350-only alternate UART pins, LEDs. The
+issue-#3 wedge fix (core-0 endpoint I/O + core-1 SWD workers) compiles for
+both chips but has not yet been re-validated on hardware, and the deep-wedge
+half of that issue (abandoned EP0 control transfer parks `usb_task`) needs
+the embassy-fork fix, not just this firmware.
