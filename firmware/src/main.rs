@@ -28,6 +28,7 @@ mod dap;
 mod flash_config;
 mod instances;
 mod reset_iface;
+mod stall_diag;
 mod swd;
 mod uart_bridge;
 mod vendor;
@@ -494,6 +495,7 @@ async fn dap_io_task(
     const DAP_INFO: u8 = 0x00;
     let mut request = [0u8; DAP_PACKET_SIZE as usize];
     let mut response = [0u8; DAP_PACKET_SIZE as usize];
+    let mut diag = stall_diag::Lane::new(idx, in_ep.info().addr.index());
     loop {
         out_ep.wait_enabled().await;
         info!("DAP interface enabled ({})", serial);
@@ -505,12 +507,16 @@ async fn dap_io_task(
             if n == 0 {
                 continue;
             }
+            let stamp = diag.request();
 
             let (len, after) = match request[0] {
-                DAP_INFO => (
-                    dap_info_response(&request[..n], serial, &mut response),
-                    AfterResponse::Nothing,
-                ),
+                DAP_INFO => {
+                    let len = match diag.info(&request[..n], &mut response) {
+                        Some(len) => len,
+                        None => dap_info_response(&request[..n], serial, &mut response),
+                    };
+                    (len, AfterResponse::Nothing)
+                }
                 cmd if (VENDOR_BASE..=VENDOR_END).contains(&cmd) => {
                     service.handle(&request[..n], &mut response).await
                 }
@@ -521,6 +527,7 @@ async fn dap_io_task(
                     // Always collect the response, even if the endpoint dies
                     // meanwhile, so the channels never go out of step.
                     let resp = WORKER_RESP[idx].receive().await;
+                    diag.worker_answered(&stamp);
                     response[..resp.len as usize].copy_from_slice(&resp.buf[..resp.len as usize]);
                     (resp.len as usize, AfterResponse::Nothing)
                 }
@@ -531,6 +538,7 @@ async fn dap_io_task(
             if in_ep.write(&response[..len]).await.is_err() {
                 break;
             }
+            diag.reply_armed(&stamp);
             match after {
                 AfterResponse::Nothing => {}
                 AfterResponse::Reboot => service.reboot().await,

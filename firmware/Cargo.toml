@@ -9,6 +9,9 @@ default = ["rp2040"]
 rp2040 = ["embassy-rp/rp2040"]
 # Pico 2 (RP2350A). For RP2350B boards use this feature too and adjust pins.
 rp2350 = ["embassy-rp/rp235xa"]
+# Per-lane reply-stall counters, read via DAP_Info id 0xA0 (tools/stress
+# `mpdiag`); see src/stall_diag.rs. Off by default.
+stall-diag = []
 
 [dependencies]
 probe-config = { path = "../probe-config" }
