@@ -121,6 +121,20 @@ rx = 5
 baud = 115200
 ```
 
+## Stress testing
+
+`tools/stress/` holds bench tools for concurrent-lane testing:
+
+- `mpstress` runs bulk, word, churn and uptime load on every lane at once,
+  with per-lane throughput, latency and error accounting.
+- `mpdiag` reads the per-lane reply-stall counters. These need firmware
+  built with `--features stall-diag`.
+- `scripts/usb_stalls.py` finds stalls in usbmon captures.
+
+It is a standalone crate outside the workspace, with its own `cargo build` in
+that directory. See `tools/stress/README.md` for usage and baselines
+(issue #4).
+
 ## Current state
 
 Multi-instance topology read from flash at boot (falling back to the stock

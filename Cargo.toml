@@ -8,6 +8,8 @@ members = [
     "firmware",
     "cli",
 ]
+# Bench-only host tools with heavy deps (probe-rs); built from their own dir.
+exclude = ["tools/stress"]
 
 [workspace.package]
 edition = "2021"

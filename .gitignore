@@ -1,3 +1,4 @@
 /target
 /webui/dist
 /probe-config-wasm/pkg
+/tools/stress/target

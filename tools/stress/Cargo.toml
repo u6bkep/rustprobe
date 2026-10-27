@@ -1,0 +1,30 @@
+[package]
+name = "rustprobe-stress"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Concurrent-lane stress test and benchmark for rustprobe (host side, probe-rs)"
+publish = false
+
+# Standalone on purpose: probe-rs and nusb are heavy and only needed on a
+# bench, so this stays out of the firmware workspace (and its CI).
+[workspace]
+
+[[bin]]
+name = "mpstress"
+path = "src/main.rs"
+
+[[bin]]
+name = "mpdiag"
+path = "src/bin/mpdiag.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+nusb = "0.2"
+probe-rs = "0.31"
+serde_json = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = 1
