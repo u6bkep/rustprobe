@@ -188,6 +188,14 @@ fn run_keep(dap: &mut TestDap, request: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn write_abort_ignores_ack_and_host_status_rejects_unknown_type() {
+    let mut d = dap(vec![xfer(req::ABORT_WRITE, 0x1E, (ack::NO_ACK, 0))]);
+    assert_eq!(run(&mut d, &[0x08, 0, 0x1E, 0, 0, 0]), [0x08, 0]);
+    assert_eq!(run(&mut d, &[0x01, 0, 1]), [0x01, 0]);
+    assert_eq!(run(&mut d, &[0x01, 2, 1]), [0x01, 0xFF]);
+}
+
+#[test]
 fn configure_reaches_the_driver() {
     let mut d = dap(vec![xfer(req::ABORT_WRITE, 0x1E, (OK, 0))]);
     // SWD_Configure: turnaround 3, data phase on. TransferConfigure: idle 4.

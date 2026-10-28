@@ -558,6 +558,9 @@ impl Driver for PioSwd {
     // hand-written futures; that matches the trait's signature cheaply.
     async fn read_block(&mut self, request: u8, out: &mut [u8], params: &TransferParams, wait_retries: u16) -> (u16, u8) {
         let count = (out.len() / 4) as u16;
+        if count == 0 {
+            return (0, 0);
+        }
         ReadBlockFuture {
             drv: self,
             request,
@@ -573,6 +576,9 @@ impl Driver for PioSwd {
 
     async fn write_block(&mut self, request: u8, data: &[u8], params: &TransferParams, wait_retries: u16) -> (u16, u8) {
         let count = (data.len() / 4) as u16;
+        if count == 0 {
+            return (0, 0);
+        }
         WriteBlockFuture {
             drv: self,
             request,

@@ -134,7 +134,7 @@ impl<D: Driver, T: DelayNs> Dap<D, T> {
         match kind {
             0 => self.driver.host_status(HostStatus::Connected(value)),
             1 => self.driver.host_status(HostStatus::Running(value)),
-            _ => {}
+            _ => return None,
         }
         resp.u8(DAP_OK)
     }
@@ -166,8 +166,10 @@ impl<D: Driver, T: DelayNs> Dap<D, T> {
     async fn write_abort(&mut self, req: &mut Request<'_>, resp: &mut Response<'_>) -> Option<()> {
         let _index = req.u8()?;
         let word = req.u32()?;
-        let t = self.driver.transfer(req::ABORT_WRITE, word, &self.params).await;
-        resp.u8(if t.ack == ack::OK { DAP_OK } else { DAP_ERROR })
+        // The reference ignores the ACK: the host uses ABORT to recover from
+        // sticky errors, when the DP may well not answer OK.
+        self.driver.transfer(req::ABORT_WRITE, word, &self.params).await;
+        resp.u8(DAP_OK)
     }
 
     async fn delay(&mut self, req: &mut Request<'_>, resp: &mut Response<'_>) -> Option<()> {
