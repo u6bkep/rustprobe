@@ -72,10 +72,13 @@ counts:
 - requests handed to its SWD worker;
 - worker answers and request-to-reply-armed times over 100 ms, plus the maxima;
 - requests that arrived while the lane's previous reply was still armed and
-  uncollected, with that reply's age.
+  uncollected, with that reply's age;
+- core-1 time spent inside `process_command` for the lane, summed (`busy_us`,
+  wraps after ~71 min) and max; `mpdiag` derives `mean_busy_us` per command.
 
-`mpdiag` prints them. Lanes held by another process are skipped, so run it
-after `mpstress` exits. If `unread` is non-zero while `slow_*` is zero, the
+`mpdiag` prints them; `mpdiag --reset` zeroes every lane first, so the usual
+sequence is reset, run `mpstress`, read. Lanes held by another process are
+skipped, so run it after `mpstress` exits. If `unread` is non-zero while `slow_*` is zero, the
 probe answered in time and the host or USB path didn't fetch the reply. A
 non-zero `slow_*` means the probe itself was late. Stock firmware returns no
 counters.

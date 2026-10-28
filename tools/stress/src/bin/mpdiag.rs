@@ -13,8 +13,12 @@ use nusb::transfer::{Buffer, Bulk, Direction, In, Out};
 use nusb::MaybeFuture;
 
 const DIAG_INFO_ID: u8 = 0xA0;
+/// Zeroes the lane's counters, then returns them.
+const DIAG_RESET_ID: u8 = 0xA1;
 /// Field order of the 0xA0 reply (u32 LE each), as defined by the firmware.
-const FIELDS: [&str; 7] = ["cmds", "slow_worker", "max_worker_us", "unread", "max_unread_ms", "slow_arm", "max_arm_us"];
+const FIELDS: [&str; 9] = [
+    "cmds", "slow_worker", "max_worker_us", "unread", "max_unread_ms", "slow_arm", "max_arm_us", "busy_us", "max_busy_us",
+];
 const TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
@@ -23,6 +27,9 @@ struct Args {
     /// USB serial of the probe; needed only when several are attached.
     #[arg(long)]
     serial: Option<String>,
+    /// Zero every lane's counters (and print the zeroed values).
+    #[arg(long)]
+    reset: bool,
 }
 
 fn main() -> Result<()> {
@@ -44,7 +51,7 @@ fn main() -> Result<()> {
         .map(|i| i.interface_number())
         .collect();
     for lane in lanes {
-        match read_lane(&dev, lane) {
+        match read_lane(&dev, lane, args.reset) {
             Ok(line) => println!("lane {lane}: {line}"),
             Err(e) => println!("lane {lane}: {e:#}"),
         }
@@ -52,7 +59,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn read_lane(dev: &nusb::Device, lane: u8) -> Result<String> {
+fn read_lane(dev: &nusb::Device, lane: u8, reset: bool) -> Result<String> {
     let iface = dev.claim_interface(lane).wait().context("claim (lane in use?)")?;
     let desc = iface.descriptor().ok_or_else(|| anyhow!("no interface descriptor"))?;
     let bulk_ep = |dir: Direction| {
@@ -66,7 +73,8 @@ fn read_lane(dev: &nusb::Device, lane: u8) -> Result<String> {
     let mut inp = iface.endpoint::<Bulk, In>(in_addr)?;
 
     let mut req = Buffer::new(2);
-    req.extend_from_slice(&[0x00, DIAG_INFO_ID]); // DAP_Info, id
+    let id = if reset { DIAG_RESET_ID } else { DIAG_INFO_ID };
+    req.extend_from_slice(&[0x00, id]); // DAP_Info, id
     out.submit(req);
     out.wait_next_complete(TIMEOUT).ok_or_else(|| anyhow!("write timeout"))?.status?;
     inp.submit(Buffer::new(64));
@@ -80,13 +88,13 @@ fn read_lane(dev: &nusb::Device, lane: u8) -> Result<String> {
     if reply.len() < 2 + 4 * FIELDS.len() || reply[1] as usize != 4 * FIELDS.len() {
         bail!("unexpected reply {reply:02x?}");
     }
-    let fields: Vec<String> = FIELDS
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let v = u32::from_le_bytes(reply[2 + 4 * i..6 + 4 * i].try_into().unwrap());
-            format!("{name}={v}")
-        })
+    let values: Vec<u32> = (0..FIELDS.len())
+        .map(|i| u32::from_le_bytes(reply[2 + 4 * i..6 + 4 * i].try_into().unwrap()))
         .collect();
+    let mut fields: Vec<String> = FIELDS.iter().zip(&values).map(|(name, v)| format!("{name}={v}")).collect();
+    let (cmds, busy_us) = (values[0], values[7]);
+    if cmds > 0 {
+        fields.push(format!("mean_busy_us={:.1}", busy_us as f64 / cmds as f64));
+    }
     Ok(fields.join(" "))
 }

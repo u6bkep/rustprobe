@@ -472,7 +472,9 @@ async fn swd_worker(mut dap: DapHandler, idx: usize) -> ! {
             WorkerRequest::Suspend => dap.suspend(),
             WorkerRequest::Process(req) => {
                 let mut resp = DapPacket { len: 0, buf: [0; DAP_PACKET_SIZE as usize] };
+                let busy = stall_diag::worker_start();
                 let len = dap.process_command(&req.buf[..req.len as usize], &mut resp.buf);
+                stall_diag::worker_done(idx, busy);
                 resp.len = len as u8;
                 WORKER_RESP[idx].send(resp).await;
             }

@@ -7,7 +7,9 @@
 //! * when a request arrives, whether its previous reply is still armed in the
 //!   IN buffer — the host sent a new request without having taken it;
 //! * how long the SWD worker took to answer, and how long from request to
-//!   reply armed.
+//!   reply armed;
+//! * (from the worker on core 1) the time spent inside `process_command`,
+//!   summed and max — the core-1 cost per command (issue #5).
 //!
 //! The counters are read with `DAP_Info` id 0xA0 on the lane's own
 //! interface (answered on core 0, like the rest of `DAP_Info`); the host tool
@@ -27,6 +29,8 @@ mod enabled {
 
     /// `DAP_Info` id carrying this lane's counters (vendor-unassigned).
     const INFO_ID: u8 = 0xA0;
+    /// `DAP_Info` id that zeroes this lane's counters, then returns them.
+    const RESET_ID: u8 = 0xA1;
 
     /// Reply fields, in wire order (u32 LE each). `tools/stress` mirrors this.
     #[derive(Clone, Copy)]
@@ -43,8 +47,12 @@ mod enabled {
         /// Request-to-reply-armed slower than [`SLOW_US`].
         SlowArm,
         MaxArmUs,
+        /// Core-1 time spent inside `process_command`, summed (µs; wraps
+        /// after ~71 min — reset with [`RESET_ID`] before a run).
+        BusyUs,
+        MaxBusyUs,
     }
-    const FIELDS: usize = 7;
+    const FIELDS: usize = 9;
     const SLOW_US: u32 = 100_000;
 
     /// Written only by the lane's own `dap_io_task` (core 0).
@@ -53,6 +61,22 @@ mod enabled {
 
     /// When a request arrived.
     pub struct Stamp(Instant);
+
+    /// When the SWD worker started a command (core 1).
+    pub struct Busy(Instant);
+
+    /// The SWD worker on core 1 is about to run a command.
+    #[inline]
+    pub fn worker_start() -> Busy {
+        Busy(Instant::now())
+    }
+
+    /// The SWD worker finished the command started at `b`.
+    pub fn worker_done(idx: usize, b: Busy) {
+        let us = b.0.elapsed().as_micros() as u32;
+        COUNTERS[idx][Field::BusyUs as usize].fetch_add(us, Ordering::Relaxed);
+        COUNTERS[idx][Field::MaxBusyUs as usize].fetch_max(us, Ordering::Relaxed);
+    }
 
     /// One lane's diagnostic state, owned by its `dap_io_task`.
     pub struct Lane {
@@ -118,8 +142,14 @@ mod enabled {
         /// Answer a `DAP_Info` [`INFO_ID`] request with this lane's counters;
         /// `None` for any other request. Returns the response length.
         pub fn info(&self, request: &[u8], response: &mut [u8]) -> Option<usize> {
-            if request.get(1) != Some(&INFO_ID) {
-                return None;
+            match request.get(1) {
+                Some(&INFO_ID) => {}
+                Some(&RESET_ID) => {
+                    for c in COUNTERS[self.idx].iter() {
+                        c.store(0, Ordering::Relaxed);
+                    }
+                }
+                _ => return None,
             }
             response[0] = request[0];
             response[1] = (FIELDS * 4) as u8;
@@ -134,6 +164,15 @@ mod enabled {
 #[cfg(not(feature = "stall-diag"))]
 mod disabled {
     pub struct Stamp;
+
+    pub struct Busy;
+
+    #[inline(always)]
+    pub fn worker_start() -> Busy {
+        Busy
+    }
+    #[inline(always)]
+    pub fn worker_done(_idx: usize, _b: Busy) {}
 
     pub struct Lane;
 
