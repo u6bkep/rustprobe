@@ -1,0 +1,13 @@
+# Official Raspberry Pi Debug Probe (RP2040), stock layout: the "D"
+# connector as one SWD lane (SWCLK GP12, SWDIO driven on GP14; GP13 is the
+# stock firmware's separate SWDIO sense pin and is left as an input) and the
+# "U" connector as the CDC-UART bridge. The U connector's buffering is
+# unidirectional, so it cannot carry a second SWD lane.
+[[probes]]
+swclk = 12
+swdio = 14
+
+[[uarts]]
+tx = 4
+rx = 5
+baud = 115200

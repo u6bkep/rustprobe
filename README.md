@@ -167,6 +167,14 @@ CMSIS-DAP reference implementation (posted AP reads, trailing `RDBUFF` read
 after writes, `DAP_TransferConfigure` idle cycles honoured, transfer counts
 that exclude the failing transfer).
 
+Official Raspberry Pi Debug Probe (RP2040): `configs/DebugProbe.toml` gives
+the stock layout, the D connector as one SWD lane (SWCLK GP12, SWDIO on
+GP14) and the U connector as the UART bridge. The U connector's buffering is
+unidirectional, so it cannot be a second SWD lane. Validated 2026-10-28 with
+the async firmware: bulk at 100 kHz / 4 MHz / 20 MHz and word ops, zero
+errors or mismatches; 182 KB/s single-lane bulk and ~765 word ops/s at
+20 MHz (the RP2350 does 304 KB/s and ~1180/s).
+
 Hardware-validated on an RP2040 Pico (July 2026): probe-rs walks a Pico 2 W's
 CoreSight topology and sustains ~110 KB/s verified RAM read/write at 3 MHz
 SWD; topology set/get/commit over USB survives reflash. `bcdDevice` reports
