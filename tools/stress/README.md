@@ -80,7 +80,10 @@ counts:
   worker end to pickup (`outbound_us`), so `worker - busy - in - out` is the
   worker's own queueing behind other lanes;
 - `fifo_yields`: PIO FIFO waits that outlived the spin budget and yielded to
-  the other lanes (global across lanes, reported on every lane).
+  the other lanes (global across lanes, reported on every lane);
+- `xip_hit` / `xip_acc`: the chip's XIP (flash) cache counters since the
+  reset, both cores; `mpdiag` prints the hit rate and misses per command of
+  the lane it is reading (a miss costs ~0.3 µs).
 
 `mpdiag` prints them; `mpdiag --reset` zeroes every lane first, so the usual
 sequence is reset, run `mpstress`, read. Lanes held by another process are
@@ -127,6 +130,17 @@ lanes bulk @ 100 kHz.
 | 2 fast | 187 → 194 | 1.23 → 1.15 ms |
 | + 1 slow | 6.0 → 175 | 37.3 → 1.26 ms |
 | + 4 slow | 1.9 → 158 | 130.6 → 1.42 ms |
+
+With the 512-byte DAP packet (issue #6, four targets left on the fixture:
+lanes 0, 1, 2, 5), same path and recipe:
+
+| Test | 64-byte packet | 512-byte packet |
+|---|---|---|
+| 1 lane bulk 20 MHz | 203 KB/s | 304 KB/s |
+| 4 lanes bulk 20 MHz | ~139 KB/s per lane | 551 KB/s (138 per lane) |
+| 4 lanes bulk 4 MHz | ~50 KB/s per lane (6 lanes) | 318 KB/s (80 per lane) |
+| 1 lane word ops | 1374/s | 1180/s (same within this build with 64) |
+| 2 fast + 2 slow: word p50 | 1.26 ms (2 + 1) | 1.26 ms |
 
 - **One lane above ~4 MHz** is bound by the USB round trip; behind a hub
   that round trip is quantized to 125 µs microframes, so single-lane

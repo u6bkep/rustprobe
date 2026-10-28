@@ -15,10 +15,12 @@
 
 pub mod command;
 pub mod dap;
+pub mod framing;
 pub mod io;
 pub mod swd;
 
 pub use dap::Dap;
+pub use framing::{request_len, Framing};
 pub use swd::{Driver, HostStatus, Pins, Transfer, TransferParams};
 
 #[cfg(test)]

@@ -154,7 +154,15 @@ yield to the other lanes' workers on long ones. So a lane clocking at
 (issue #5): with two lanes at 20 MHz and four at 100 kHz, the fast lanes'
 word round trip is ~1.4 ms instead of ~130 ms, and six lanes at 4 MHz
 aggregate ~300 KB/s instead of ~175 (numbers and the bench recipe in
-`tools/stress/README.md`). Transfer semantics follow the
+`tools/stress/README.md`). `DAP_Info` advertises a 512-byte packet over
+the 64-byte full-speed endpoint (issue #6): a `DAP_TransferBlock` carries
+~126 words per USB round trip, which lifts single-lane bulk at 20 MHz from
+~200 to ~300 KB/s; the firmware reassembles requests from USB packets using
+each command's own length and ends exact-multiple replies with a
+zero-length packet. Vendor config commands stay single-packet. The command
+processor and the per-request I/O path are polled from SRAM-resident
+functions: from flash they cost ~85 XIP-cache misses per command, more
+than the command's own work. Transfer semantics follow the
 CMSIS-DAP reference implementation (posted AP reads, trailing `RDBUFF` read
 after writes, `DAP_TransferConfigure` idle cycles honoured, transfer counts
 that exclude the failing transfer).

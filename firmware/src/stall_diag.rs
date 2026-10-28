@@ -61,8 +61,12 @@ mod enabled {
         InboundUs,
         /// Core-1 worker end to core-0 pickup, summed (µs).
         OutboundUs,
+        /// XIP (flash) cache hits since the last reset (global, both cores).
+        XipHit,
+        /// XIP cache accesses since the last reset (global, both cores).
+        XipAcc,
     }
-    const FIELDS: usize = 13;
+    const FIELDS: usize = 15;
     const SLOW_US: u32 = 100_000;
 
     /// Written only by the lane's own `dap_io_task` (core 0).
@@ -190,12 +194,19 @@ mod enabled {
             }
             if request.get(1) == Some(&RESET_ID) {
                 FIFO_YIELDS.store(0, Ordering::Relaxed);
+                // Write-any-to-clear saturating counters.
+                embassy_rp::pac::XIP_CTRL.ctr_hit().write_value(0);
+                embassy_rp::pac::XIP_CTRL.ctr_acc().write_value(0);
             }
             response[0] = request[0];
             response[1] = (FIELDS * 4) as u8;
             for (i, c) in COUNTERS[self.idx].iter().enumerate() {
                 let v = if i == Field::FifoYields as usize {
                     FIFO_YIELDS.load(Ordering::Relaxed)
+                } else if i == Field::XipHit as usize {
+                    embassy_rp::pac::XIP_CTRL.ctr_hit().read()
+                } else if i == Field::XipAcc as usize {
+                    embassy_rp::pac::XIP_CTRL.ctr_acc().read()
                 } else {
                     c.load(Ordering::Relaxed)
                 };

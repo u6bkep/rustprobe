@@ -48,6 +48,25 @@ use crate::swd::{CmdAddrs, FifoRegs};
 /// Lanes currently inside `process_command`; maintained by `main.rs`.
 pub static ACTIVE_LANES: AtomicU32 = AtomicU32::new(0);
 
+/// Polls a future from a RAM-resident function. The future's generated
+/// `poll` (and everything it inlines) ends up in that function, so a whole
+/// `process_command` runs from SRAM instead of the XIP cache. Measured with
+/// the stall-diag XIP counters: ~85 flash-cache misses per `DAP_Transfer`
+/// command from flash, costing more than the command's own work (issue #6).
+pub struct InRam<F>(pub F);
+
+impl<F: Future> Future for InRam<F> {
+    type Output = F::Output;
+
+    #[unsafe(link_section = ".data.swd_hot")]
+    #[inline(never)]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        // Safety: structural pinning of the only field.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.0) };
+        inner.poll(cx)
+    }
+}
+
 /// At or above this SWCLK a wait never exceeds a cooperative yield's cost:
 /// spin through everything.
 const FAST_KHZ: u32 = 6000;
@@ -56,6 +75,11 @@ const FAST_KHZ: u32 = 6000;
 const SPIN_FAST: u32 = 160;
 /// FIFO polls before yielding at lower clocks: one re-check, then yield.
 const SPIN_SLOW: u32 = 2;
+/// With other lanes active, a lane that spins through its waits still
+/// yields once every this many transfers, so a long command (a 512-byte
+/// block is ~126 words, ~340 µs at 20 MHz) bounds the others' wait to a
+/// few words instead of a whole command.
+const YIELD_EVERY: u32 = 8;
 
 /// The FIFO operations of one stage of a transfer: words to push, with a
 /// bit set in `pulls` for each slot that is a pull instead. Long enough for
@@ -111,13 +135,15 @@ pub struct PioSwd {
     addrs: CmdAddrs,
     /// FIFO polls before yielding, for the current SWCLK.
     spin: u32,
+    /// Transfers completed since this lane last yielded.
+    run: u32,
 }
 
 impl PioSwd {
     pub fn new(bus: DynEngine) -> Self {
         let fifo = bus.fifo();
         let addrs = bus.addrs();
-        let mut this = Self { bus, fifo, addrs, spin: 0 };
+        let mut this = Self { bus, fifo, addrs, spin: 0, run: 0 };
         this.update_spin();
         this
     }
@@ -325,6 +351,14 @@ impl TransferState {
         loop {
             match self.stage {
                 Stage::Start => {
+                    if drv.run >= YIELD_EVERY {
+                        drv.run = 0;
+                        if ACTIVE_LANES.load(Ordering::Relaxed) > 1 {
+                            crate::stall_diag::fifo_yield();
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                    }
                     self.plan = drv.plan_request(request, p.turnaround as u32);
                     self.cur = Cursor::new();
                     self.stage = Stage::Request;
@@ -356,6 +390,7 @@ impl TransferState {
                         Transfer { ack: self.ack, data: 0 }
                     };
                     self.stage = Stage::Start;
+                    drv.run += 1;
                     return Poll::Ready(t);
                 }
             }

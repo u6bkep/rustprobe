@@ -35,6 +35,8 @@ mod swd;
 mod uart_bridge;
 mod vendor;
 
+use core::cell::UnsafeCell;
+
 use defmt::{info, warn};
 use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_executor::{Executor, Spawner};
@@ -111,8 +113,15 @@ fn default_topology() -> Topology {
     t
 }
 
-/// CMSIS-DAP packet size (bulk full-speed MPS).
-const DAP_PACKET_SIZE: u16 = 64;
+/// Full-speed bulk endpoint packet size.
+const USB_MPS: u16 = 64;
+
+/// CMSIS-DAP logical packet size, as advertised by `DAP_Info`. Larger than
+/// the USB packet: a request or reply spans several USB packets, and a
+/// `DAP_TransferBlock` carries ~126 words per USB round trip instead of 14
+/// (issue #6). Hosts size their requests from this value; vendor config
+/// commands stay single-packet (`probe_config::protocol`).
+const DAP_PACKET_SIZE: u16 = 512;
 
 /// CMSIS-DAP firmware version reported by `DAP_Info`; passed to dap-async
 /// and mirrored by the core-0 fast path (`dap_info_response`).
@@ -309,8 +318,8 @@ async fn main(spawner: Spawner) {
         ));
         let mut iface = func.interface();
         let mut alt = iface.alt_setting(0xFF, 0, 0, Some(dap_str));
-        let out_ep = alt.endpoint_bulk_out(None, DAP_PACKET_SIZE);
-        let in_ep = alt.endpoint_bulk_in(None, DAP_PACKET_SIZE);
+        let out_ep = alt.endpoint_bulk_out(None, USB_MPS);
+        let in_ep = alt.endpoint_bulk_in(None, USB_MPS);
         drop(func);
         endpoints.push((out_ep, in_ep)).ok().unwrap();
     }
@@ -425,30 +434,55 @@ async fn usb_task(mut usb: UsbDevice<'static, Driver<'static, USB>>) -> ! {
     usb.run().await
 }
 
-/// One in-flight DAP packet, shipped between a core-0 I/O task and its
-/// core-1 SWD worker.
+/// A lane's DAP request and reply buffers, shared by its core-0 I/O task
+/// and its core-1 SWD worker without copying.
 ///
-/// Word-aligned on purpose: the packet is moved several times per command
-/// through the channels, and as a 65-byte, byte-aligned struct those moves
-/// were byte copies that cost ~40 µs of cross-core hand-off per command
-/// (measured with the stall-diag inbound/outbound counters, issue #5).
-#[repr(C, align(4))]
-struct DapPacket {
-    len: u8,
-    buf: [u8; DAP_PACKET_SIZE as usize],
-    /// Microsecond timestamp of the hand-off, for the stall-diag cross-core
-    /// latency counters (always present; 4 bytes).
-    stamp: u32,
+/// Ownership alternates by protocol: the I/O task fills `req` and sends
+/// `WorkerRequest::Process`, then touches neither buffer until the
+/// `Done` reply arrives; the worker touches them only between those two
+/// channel operations. The channels' critical sections order the accesses
+/// across cores. Moving the packets through the channels by value instead
+/// cost ~45 µs per hop at 512 bytes (byte-wise moves, measured with the
+/// stall-diag inbound/outbound counters, issue #6).
+struct LaneBufs {
+    req: UnsafeCell<[u8; DAP_PACKET_SIZE as usize]>,
+    resp: UnsafeCell<[u8; DAP_PACKET_SIZE as usize]>,
 }
+
+// Safety: see the protocol above; no two tasks access a lane's buffers at
+// the same time.
+unsafe impl Sync for LaneBufs {}
+
+impl LaneBufs {
+    const fn new() -> Self {
+        Self { req: UnsafeCell::new([0; DAP_PACKET_SIZE as usize]), resp: UnsafeCell::new([0; DAP_PACKET_SIZE as usize]) }
+    }
+
+    /// Safety: the caller holds the lane's turn (see the type docs).
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self) -> (&mut [u8; DAP_PACKET_SIZE as usize], &mut [u8; DAP_PACKET_SIZE as usize]) {
+        unsafe { (&mut *self.req.get(), &mut *self.resp.get()) }
+    }
+}
+
+static LANE_BUFS: [LaneBufs; MAX_PROBES] = [const { LaneBufs::new() }; MAX_PROBES];
 
 /// Request to a core-1 SWD worker.
 enum WorkerRequest {
-    /// Run one CMSIS-DAP command; the worker sends one `DapPacket` back on
-    /// `WORKER_RESP` (len 0 = no response, e.g. `DAP_TransferAbort`).
-    Process(DapPacket),
+    /// Run the CMSIS-DAP command of `len` bytes in the lane's request
+    /// buffer; the worker answers with `WorkerReply` (len 0 = no response,
+    /// e.g. `DAP_TransferAbort`). `stamp`: hand-off time (stall-diag).
+    Process { len: u16, stamp: u32 },
     /// The interface went down: `Dap::suspend` (park SWDIO, release nRESET).
     /// No response.
     Suspend,
+}
+
+/// Reply from a core-1 SWD worker: the response is in the lane's reply
+/// buffer.
+struct WorkerReply {
+    len: u16,
+    stamp: u32,
 }
 
 /// Per-probe channels between I/O task (core 0) and SWD worker (core 1).
@@ -457,7 +491,7 @@ enum WorkerRequest {
 /// a `Suspend` behind an abandoned `Process` is the deepest it ever gets.
 static WORKER_REQ: [Channel<CriticalSectionRawMutex, WorkerRequest, 1>; MAX_PROBES] =
     [const { Channel::new() }; MAX_PROBES];
-static WORKER_RESP: [Channel<CriticalSectionRawMutex, DapPacket, 1>; MAX_PROBES] =
+static WORKER_RESP: [Channel<CriticalSectionRawMutex, WorkerReply, 1>; MAX_PROBES] =
     [const { Channel::new() }; MAX_PROBES];
 
 /// SWD execution worker: the only code that touches this probe's PIO engine.
@@ -468,17 +502,16 @@ async fn swd_worker(mut dap: DapHandler, idx: usize) -> ! {
     loop {
         match WORKER_REQ[idx].receive().await {
             WorkerRequest::Suspend => dap.suspend().await,
-            WorkerRequest::Process(req) => {
-                let mut resp = DapPacket { len: 0, buf: [0; DAP_PACKET_SIZE as usize], stamp: 0 };
-                stall_diag::inbound(idx, req.stamp);
+            WorkerRequest::Process { len, stamp } => {
+                // Safety: our turn with the lane's buffers (see `LaneBufs`).
+                let (req, resp) = unsafe { LANE_BUFS[idx].get() };
+                stall_diag::inbound(idx, stamp);
                 let busy = stall_diag::worker_start();
                 dap::ACTIVE_LANES.fetch_add(1, Ordering::Relaxed);
-                let len = dap.process_command(&req.buf[..req.len as usize], &mut resp.buf).await;
+                let len = dap::InRam(dap.process_command(&req[..len as usize], resp)).await;
                 dap::ACTIVE_LANES.fetch_sub(1, Ordering::Relaxed);
                 stall_diag::worker_done(idx, busy);
-                resp.len = len as u8;
-                resp.stamp = stall_diag::now_us();
-                WORKER_RESP[idx].send(resp).await;
+                WORKER_RESP[idx].send(WorkerReply { len: len as u16, stamp: stall_diag::now_us() }).await;
             }
         }
     }
@@ -496,67 +529,123 @@ async fn dap_io_task(
     serial: &'static str,
     service: &'static ConfigService,
 ) -> ! {
-    const DAP_INFO: u8 = 0x00;
-    let mut request = [0u8; DAP_PACKET_SIZE as usize];
-    let mut response = [0u8; DAP_PACKET_SIZE as usize];
     let mut diag = stall_diag::Lane::new(idx, in_ep.info().addr.index());
     loop {
         out_ep.wait_enabled().await;
         info!("DAP interface enabled ({})", serial);
-        loop {
-            let n = match out_ep.read(&mut request).await {
-                Ok(n) => n,
-                Err(_) => break, // endpoint disabled (unconfigured/suspended)
-            };
-            if n == 0 {
-                continue;
-            }
-            let stamp = diag.request();
-
-            let (len, after) = match request[0] {
-                DAP_INFO => {
-                    let len = match diag.info(&request[..n], &mut response) {
-                        Some(len) => len,
-                        None => dap_info_response(&request[..n], serial, &mut response),
-                    };
-                    (len, AfterResponse::Nothing)
-                }
-                cmd if (VENDOR_BASE..=VENDOR_END).contains(&cmd) => {
-                    service.handle(&request[..n], &mut response).await
-                }
-                _ => {
-                    let mut req = DapPacket { len: n as u8, buf: [0; DAP_PACKET_SIZE as usize], stamp: stall_diag::now_us() };
-                    req.buf[..n].copy_from_slice(&request[..n]);
-                    WORKER_REQ[idx].send(WorkerRequest::Process(req)).await;
-                    // Always collect the response, even if the endpoint dies
-                    // meanwhile, so the channels never go out of step.
-                    let resp = WORKER_RESP[idx].receive().await;
-                    stall_diag::outbound(idx, resp.stamp);
-                    diag.worker_answered(&stamp);
-                    response[..resp.len as usize].copy_from_slice(&resp.buf[..resp.len as usize]);
-                    (resp.len as usize, AfterResponse::Nothing)
-                }
-            };
-            if len == 0 {
-                continue; // e.g. DAP_TransferAbort: no response
-            }
-            if in_ep.write(&response[..len]).await.is_err() {
-                break;
-            }
-            diag.reply_armed(&stamp);
-            match after {
-                AfterResponse::Nothing => {}
-                AfterResponse::Reboot => service.reboot().await,
-                AfterResponse::Bootsel => {
-                    // Give the host time to collect the response first.
-                    embassy_time::Timer::after_millis(100).await;
-                    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
-                }
-            }
-        }
+        // Polled from RAM: the request/reply path, with the endpoint
+        // futures it inlines, otherwise walks ~8 KB of flash per command
+        // and competes with core 1 for the XIP cache (see `dap::InRam`).
+        while dap::InRam(serve_request(idx, &mut out_ep, &mut in_ep, serial, service, &mut diag)).await.is_ok() {}
         info!("DAP interface disabled ({})", serial);
         WORKER_REQ[idx].send(WorkerRequest::Suspend).await;
     }
+}
+
+/// One request/reply exchange on a DAP interface. `Err` when the endpoint
+/// went down (unconfigured/suspended).
+async fn serve_request(
+    idx: usize,
+    out_ep: &mut Endpoint<'static, USB, Out>,
+    in_ep: &mut Endpoint<'static, USB, In>,
+    serial: &'static str,
+    service: &'static ConfigService,
+    diag: &mut stall_diag::Lane,
+) -> Result<(), ()> {
+    const DAP_INFO: u8 = 0x00;
+    // Safety: our turn with the lane's buffers (see `LaneBufs`); the worker
+    // holds them only between the `Process` send and the reply receive.
+    let (request, response) = unsafe { LANE_BUFS[idx].get() };
+    let n = match read_request(out_ep, request).await? {
+        Some(n) => n,
+        None => return Ok(()), // empty or oversized request: nothing to answer
+    };
+    let stamp = diag.request();
+
+    let (len, after) = match request[0] {
+        DAP_INFO => {
+            let len = match diag.info(&request[..n], response) {
+                Some(len) => len,
+                None => dap_info_response(&request[..n], serial, response),
+            };
+            (len, AfterResponse::Nothing)
+        }
+        cmd if (VENDOR_BASE..=VENDOR_END).contains(&cmd) => service.handle(&request[..n], response).await,
+        _ => {
+            WORKER_REQ[idx].send(WorkerRequest::Process { len: n as u16, stamp: stall_diag::now_us() }).await;
+            // Always collect the response, even if the endpoint dies
+            // meanwhile, so the channels never go out of step.
+            let reply = WORKER_RESP[idx].receive().await;
+            stall_diag::outbound(idx, reply.stamp);
+            diag.worker_answered(&stamp);
+            (reply.len as usize, AfterResponse::Nothing)
+        }
+    };
+    if len == 0 {
+        return Ok(()); // e.g. DAP_TransferAbort: no response
+    }
+    // Standard-command hosts read `DAP_PACKET_SIZE` at a time, so a reply
+    // that is an exact multiple of the USB packet needs a zero-length
+    // packet to end it. Vendor hosts (the CLI, the web UI) read exactly one
+    // USB packet and must not get one.
+    let zlp = !(VENDOR_BASE..=VENDOR_END).contains(&request[0]);
+    write_response(in_ep, &response[..len], zlp).await?;
+    diag.reply_armed(&stamp);
+    match after {
+        AfterResponse::Nothing => {}
+        AfterResponse::Reboot => service.reboot().await,
+        AfterResponse::Bootsel => {
+            // Give the host time to collect the response first.
+            embassy_time::Timer::after_millis(100).await;
+            embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+        }
+    }
+    Ok(())
+}
+
+/// Read one DAP request, reassembling it from USB packets: a short packet
+/// ends it, and so does reaching the length the command itself implies
+/// (`dap_async::request_len`), which is how a request that is an exact
+/// multiple of the USB packet size ends. Vendor commands are single-packet
+/// by protocol. Returns `Ok(None)` for an empty request or one that would
+/// overflow the buffer (the rest of it is discarded packet by packet as it
+/// arrives, as the next "request"), `Err` when the endpoint goes down.
+async fn read_request(
+    out_ep: &mut Endpoint<'static, USB, Out>,
+    request: &mut [u8; DAP_PACKET_SIZE as usize],
+) -> Result<Option<usize>, ()> {
+    use dap_async::Framing;
+    let mps = USB_MPS as usize;
+    let mut len = 0;
+    loop {
+        if len + mps > request.len() {
+            warn!("DAP request over {} bytes, dropped", request.len());
+            return Ok(None);
+        }
+        let n = out_ep.read(&mut request[len..len + mps]).await.map_err(|_| ())?;
+        len += n;
+        if n < mps {
+            break;
+        }
+        match dap_async::request_len(&request[..len]) {
+            Framing::NeedMore => continue,
+            Framing::Complete(_) | Framing::Unknown => break,
+        }
+    }
+    Ok(if len == 0 { None } else { Some(len) })
+}
+
+/// Send one DAP reply as USB packets, ending an exact multiple of the USB
+/// packet size with a zero-length packet when `zlp` is set.
+async fn write_response(in_ep: &mut Endpoint<'static, USB, In>, data: &[u8], zlp: bool) -> Result<(), ()> {
+    let mps = USB_MPS as usize;
+    for chunk in data.chunks(mps) {
+        in_ep.write(chunk).await.map_err(|_| ())?;
+    }
+    if zlp && data.len().is_multiple_of(mps) {
+        in_ep.write(&[]).await.map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 /// Answer a `DAP_Info` request on core 0, byte-identical to what dap-async

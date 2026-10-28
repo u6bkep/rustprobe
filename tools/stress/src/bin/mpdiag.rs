@@ -16,9 +16,9 @@ const DIAG_INFO_ID: u8 = 0xA0;
 /// Zeroes the lane's counters, then returns them.
 const DIAG_RESET_ID: u8 = 0xA1;
 /// Field order of the 0xA0 reply (u32 LE each), as defined by the firmware.
-const FIELDS: [&str; 13] = [
+const FIELDS: [&str; 15] = [
     "cmds", "slow_worker", "max_worker_us", "unread", "max_unread_ms", "slow_arm", "max_arm_us", "busy_us", "max_busy_us",
-    "fifo_yields", "worker_us", "inbound_us", "outbound_us",
+    "fifo_yields", "worker_us", "inbound_us", "outbound_us", "xip_hit", "xip_acc",
 ];
 const TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -105,6 +105,11 @@ fn read_lane(dev: &nusb::Device, lane: u8, reset: bool) -> Result<String> {
         }
         if let (Some(i), Some(o)) = (values.get(11), values.get(12)) {
             fields.push(format!("in/cmd={:.1} out/cmd={:.1}", *i as f64 / cmds as f64, *o as f64 / cmds as f64));
+        }
+        if let (Some(h), Some(a)) = (values.get(13), values.get(14)) {
+            if *a > 0 {
+                fields.push(format!("xip_hit_rate={:.2}% misses/cmd={:.0}", 100.0 * *h as f64 / *a as f64, (*a - *h) as f64 / cmds as f64));
+            }
         }
     }
     Ok(fields.join(" "))
