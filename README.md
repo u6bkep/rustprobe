@@ -144,11 +144,20 @@ vendor bulk interface, WinUSB descriptors, per-instance serial `<uid>:<n>`,
 config vendor commands + host CLI. DAP endpoint I/O runs on core 0 next to
 the USB device task (all endpoint registers are touched from one core, and
 `DAP_Info`/config vendor commands are answered at USB latency); the SWD
-execution workers run on core 1 behind per-probe request/response channels,
-where their blocking PIO waits can spin without stalling USB or other
-probes' interface opens (see issue #3). The SWD wire engine is the C
-firmware's `probe.pio` command FIFO program driven through dap-rs's
-`Swd`/`Dependencies` traits.
+execution workers run on core 1 behind per-probe request/response channels
+(see issue #3). The CMSIS-DAP command processor is `dap-async`, an async,
+SWD-only fork of dap-rs vendored in this workspace; the SWD wire engine is
+the C firmware's `probe.pio` command FIFO program, driven by hand-written
+futures in `firmware/src/dap.rs` that spin through short FIFO waits and
+yield to the other lanes' workers on long ones. So a lane clocking at
+100 kHz no longer holds every other lane for the duration of its commands
+(issue #5): with two lanes at 20 MHz and four at 100 kHz, the fast lanes'
+word round trip is ~1.4 ms instead of ~130 ms, and six lanes at 4 MHz
+aggregate ~300 KB/s instead of ~175 (numbers and the bench recipe in
+`tools/stress/README.md`). Transfer semantics follow the
+CMSIS-DAP reference implementation (posted AP reads, trailing `RDBUFF` read
+after writes, `DAP_TransferConfigure` idle cycles honoured, transfer counts
+that exclude the failing transfer).
 
 Hardware-validated on an RP2040 Pico (July 2026): probe-rs walks a Pico 2 W's
 CoreSight topology and sustains ~110 KB/s verified RAM read/write at 3 MHz
@@ -187,12 +196,13 @@ GPIO via PIO input without disturbing the UART's ownership of the pin. See
 `firmware/src/autobaud.rs`.
 
 Not yet: host-driven UART break (embassy's `CdcAcmClass` doesn't surface CDC
-`SEND_BREAK` — `TODO(break)`), RP2350-only alternate UART pins, LEDs.
-`probe-rs info` against this firmware always fails: probe-rs's espressif
-chip detection JTAG-scans first, and dap-rs answers `DAP_JtagSequence` with
-OK-but-no-capture-data even though JTAG is reported unavailable (it should
-return DAP_ERROR so hosts skip JTAG); `probe-rs run`/`attach` are
-unaffected.
+`SEND_BREAK` — `TODO(break)`), RP2350-only alternate UART pins, LEDs,
+`DAP_TransferAbort` mid-command (the I/O task collects a command's reply
+before reading the next request, so an abort is only seen afterwards).
+JTAG commands are answered with `DAP_ERROR`, as the reference does when
+JTAG is unavailable; `probe-rs info` (0.31) still fails against this
+firmware because its espressif chip detection JTAG-scans first and treats
+that error as fatal, while `probe-rs run`/`attach` are unaffected.
 
 Multi-instance hardware validation (Aug 2026, 9-probe RP2350 LA fixture,
 issue #3): 7 concurrent `probe-rs run` flash+RTT sessions at 100 kHz SWD ran

@@ -5,6 +5,7 @@ members = [
     "probe-config-toml",
     "probe-config-wasm",
     "autobaud-estimator",
+    "dap-async",
     "firmware",
     "cli",
 ]

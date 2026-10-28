@@ -6,8 +6,10 @@
 //! fed over per-probe request/response channels. Two invariants hang off
 //! this split (see issue #3, the concurrent-open wedge):
 //!
-//! * Core 1 may busy-spin for milliseconds per DAP command (the PIO waits
-//!   in `swd.rs` are blocking), so nothing latency-sensitive lives there.
+//! * Core 1 runs one async executor for every probe's worker. A worker
+//!   yields when a PIO FIFO wait would be long (`dap.rs`), so lanes
+//!   interleave at SWD-transfer granularity and a slow lane does not hold
+//!   the others (issue #5); still, nothing latency-sensitive lives there.
 //!   Commands that touch no probe hardware — the `DAP_Info` family and the
 //!   rustprobe config vendor commands — are answered directly on core 0,
 //!   so interface opens (probe-rs sends `DAP_Info` with a 50 ms timeout)
@@ -50,12 +52,13 @@ use embassy_usb::msos::{self, windows_version};
 use embassy_usb::types::StringIndex;
 use embassy_usb::{Builder, Config, Handler, UsbDevice};
 use heapless::Vec;
+use portable_atomic::Ordering;
 use probe_config::protocol::{Chip, FirmwareInfo, PROTOCOL_VERSION, VENDOR_BASE, VENDOR_END};
 use probe_config::{BoardProfile, ChipLimits, ProbeConfig, Topology, MAX_PROBES, MAX_UARTS};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-use crate::dap::{NoLeds, ProbeContext, ProbeJtag, ProbeSwd};
+use crate::dap::PioSwd;
 use crate::flash_config::{load_profile, load_topology, ProbeFlash, FLASH_SIZE};
 use crate::instances::{build_engines, PinTable, PioBlocks};
 use crate::uart_bridge::CdcClass;
@@ -111,8 +114,8 @@ fn default_topology() -> Topology {
 /// CMSIS-DAP packet size (bulk full-speed MPS).
 const DAP_PACKET_SIZE: u16 = 64;
 
-/// CMSIS-DAP firmware version reported by `DAP_Info`; passed to dap-rs and
-/// mirrored by the core-0 fast path (`dap_info_response`).
+/// CMSIS-DAP firmware version reported by `DAP_Info`; passed to dap-async
+/// and mirrored by the core-0 fast path (`dap_info_response`).
 const DAP_FW_VERSION: &str = "2.1.0";
 
 const DAP_INTERFACE_STRING: &str = "CMSIS-DAP v2 Interface";
@@ -120,15 +123,7 @@ const DAP_INTERFACE_STRING: &str = "CMSIS-DAP v2 Interface";
 /// Same WinUSB GUID as the C firmware, so existing host setups keep working.
 const DEVICE_INTERFACE_GUIDS: &[&str] = &["{CDB3B5AD-293B-4663-AA36-1AAE46463776}"];
 
-type DapHandler = dap_rs::dap::Dap<
-    'static,
-    ProbeContext,
-    NoLeds,
-    embassy_time::Delay,
-    ProbeJtag,
-    ProbeSwd,
-    dap_rs::swo::NoSwo,
->;
+type DapHandler = dap_async::Dap<PioSwd, embassy_time::Delay>;
 
 /// Serves the CMSIS-DAP interface string (probe-rs discovers probes by it)
 /// and the pico-sdk-style "Reset" interface string.
@@ -352,18 +347,12 @@ async fn main(spawner: Spawner) {
     let usb = builder.build();
 
     // --- SWD workers (core 1) and DAP endpoint I/O tasks (core 0) ----------
-    // The worker owns the dap-rs handler (and with it the PIO engine); the
-    // I/O task owns the USB endpoints. They meet at WORKER_REQ/WORKER_RESP.
+    // The worker owns the DAP command processor (and with it the PIO
+    // engine); the I/O task owns the USB endpoints. They meet at
+    // WORKER_REQ/WORKER_RESP.
     let mut workers: Vec<DapHandler, MAX_PROBES> = Vec::new();
     for engine in engines {
-        let dap: DapHandler = dap_rs::dap::Dap::new(
-            ProbeContext::new(engine),
-            NoLeds,
-            embassy_time::Delay,
-            dap_rs::swo::NoSwo,
-            DAP_FW_VERSION,
-            DAP_PACKET_SIZE,
-        );
+        let dap = dap_async::Dap::new(PioSwd::new(engine), embassy_time::Delay, DAP_FW_VERSION, DAP_PACKET_SIZE);
         workers.push(dap).ok().unwrap();
     }
 
@@ -438,9 +427,18 @@ async fn usb_task(mut usb: UsbDevice<'static, Driver<'static, USB>>) -> ! {
 
 /// One in-flight DAP packet, shipped between a core-0 I/O task and its
 /// core-1 SWD worker.
+///
+/// Word-aligned on purpose: the packet is moved several times per command
+/// through the channels, and as a 65-byte, byte-aligned struct those moves
+/// were byte copies that cost ~40 µs of cross-core hand-off per command
+/// (measured with the stall-diag inbound/outbound counters, issue #5).
+#[repr(C, align(4))]
 struct DapPacket {
     len: u8,
     buf: [u8; DAP_PACKET_SIZE as usize],
+    /// Microsecond timestamp of the hand-off, for the stall-diag cross-core
+    /// latency counters (always present; 4 bytes).
+    stamp: u32,
 }
 
 /// Request to a core-1 SWD worker.
@@ -463,19 +461,23 @@ static WORKER_RESP: [Channel<CriticalSectionRawMutex, DapPacket, 1>; MAX_PROBES]
     [const { Channel::new() }; MAX_PROBES];
 
 /// SWD execution worker: the only code that touches this probe's PIO engine.
-/// Runs on core 1, where `process_command`'s blocking PIO waits can spin
-/// without stalling USB.
+/// Runs on core 1 alongside the other probes' workers; `process_command`
+/// yields whenever it waits on the wire.
 #[embassy_executor::task(pool_size = MAX_PROBES)]
 async fn swd_worker(mut dap: DapHandler, idx: usize) -> ! {
     loop {
         match WORKER_REQ[idx].receive().await {
-            WorkerRequest::Suspend => dap.suspend(),
+            WorkerRequest::Suspend => dap.suspend().await,
             WorkerRequest::Process(req) => {
-                let mut resp = DapPacket { len: 0, buf: [0; DAP_PACKET_SIZE as usize] };
+                let mut resp = DapPacket { len: 0, buf: [0; DAP_PACKET_SIZE as usize], stamp: 0 };
+                stall_diag::inbound(idx, req.stamp);
                 let busy = stall_diag::worker_start();
-                let len = dap.process_command(&req.buf[..req.len as usize], &mut resp.buf);
+                dap::ACTIVE_LANES.fetch_add(1, Ordering::Relaxed);
+                let len = dap.process_command(&req.buf[..req.len as usize], &mut resp.buf).await;
+                dap::ACTIVE_LANES.fetch_sub(1, Ordering::Relaxed);
                 stall_diag::worker_done(idx, busy);
                 resp.len = len as u8;
+                resp.stamp = stall_diag::now_us();
                 WORKER_RESP[idx].send(resp).await;
             }
         }
@@ -523,12 +525,13 @@ async fn dap_io_task(
                     service.handle(&request[..n], &mut response).await
                 }
                 _ => {
-                    let mut req = DapPacket { len: n as u8, buf: [0; DAP_PACKET_SIZE as usize] };
+                    let mut req = DapPacket { len: n as u8, buf: [0; DAP_PACKET_SIZE as usize], stamp: stall_diag::now_us() };
                     req.buf[..n].copy_from_slice(&request[..n]);
                     WORKER_REQ[idx].send(WorkerRequest::Process(req)).await;
                     // Always collect the response, even if the endpoint dies
                     // meanwhile, so the channels never go out of step.
                     let resp = WORKER_RESP[idx].receive().await;
+                    stall_diag::outbound(idx, resp.stamp);
                     diag.worker_answered(&stamp);
                     response[..resp.len as usize].copy_from_slice(&resp.buf[..resp.len as usize]);
                     (resp.len as usize, AfterResponse::Nothing)
@@ -556,12 +559,12 @@ async fn dap_io_task(
     }
 }
 
-/// Answer a `DAP_Info` request on core 0, byte-identical to what dap-rs's
-/// `process_info` would produce for this firmware's fixed configuration
-/// (SWD-only capabilities, `NoSwo`, no test-domain timer, 64-byte packets)
-/// — except for the serial number, where dap-rs returns an empty string and
-/// we return the per-instance serial that lets hosts tell multiprobe
-/// instances apart. Returns the response length.
+/// Answer a `DAP_Info` request on core 0, byte-identical to what dap-async
+/// produces for this firmware's fixed configuration (SWD-only capabilities,
+/// no SWO, no test-domain timer, 64-byte packets) — except for the serial
+/// number, where dap-async returns an empty string and we return the
+/// per-instance serial that lets hosts tell multiprobe instances apart.
+/// Returns the response length.
 fn dap_info_response(request: &[u8], serial: &str, response: &mut [u8]) -> usize {
     const DAP_INFO: u8 = 0x00;
     const ID_SERIAL: u8 = 0x03;
@@ -570,11 +573,7 @@ fn dap_info_response(request: &[u8], serial: &str, response: &mut [u8]) -> usize
     const ID_SWO_BUFFER_SIZE: u8 = 0xFD;
     const ID_MAX_PACKET_COUNT: u8 = 0xFE;
     const ID_MAX_PACKET_SIZE: u8 = 0xFF;
-    // dap-rs capabilities byte: bit 0 (SWD) only. JTAG is reported
-    // unavailable (`ProbeJtag::available` is false), `NoSwo` supports
-    // nothing, and `Dependencies::timer_available` is left at its false
-    // default. Revisit if any of those change.
-    const CAPABILITIES: u8 = 0x01;
+    const CAPABILITIES: u8 = dap_async::command::CAPABILITIES;
 
     response[0] = DAP_INFO;
     match request.get(1) {
@@ -603,7 +602,7 @@ fn dap_info_response(request: &[u8], serial: &str, response: &mut [u8]) -> usize
             6
         }
         Some(&ID_MAX_PACKET_COUNT) => {
-            // One packet at a time, matching dap-rs.
+            // One packet at a time, matching dap-async.
             response[1] = 1;
             response[2] = 1;
             3

@@ -51,8 +51,18 @@ mod enabled {
         /// after ~71 min — reset with [`RESET_ID`] before a run).
         BusyUs,
         MaxBusyUs,
+        /// FIFO waits that outlived the spin budget and yielded (global
+        /// across lanes; reported identically on every lane).
+        FifoYields,
+        /// Request-to-worker-answer time summed (core 0 view: includes the
+        /// cross-core channel hops), µs.
+        WorkerUs,
+        /// Core-0 hand-off to core-1 worker start, summed (µs).
+        InboundUs,
+        /// Core-1 worker end to core-0 pickup, summed (µs).
+        OutboundUs,
     }
-    const FIELDS: usize = 9;
+    const FIELDS: usize = 13;
     const SLOW_US: u32 = 100_000;
 
     /// Written only by the lane's own `dap_io_task` (core 0).
@@ -64,6 +74,32 @@ mod enabled {
 
     /// When the SWD worker started a command (core 1).
     pub struct Busy(Instant);
+
+    static FIFO_YIELDS: AtomicU32 = AtomicU32::new(0);
+
+    /// A PIO FIFO wait in `dap.rs` went past its spin budget.
+    #[inline]
+    pub fn fifo_yield() {
+        FIFO_YIELDS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Microsecond timestamp on the shared timer.
+    #[inline]
+    pub fn now_us() -> u32 {
+        Instant::now().as_micros() as u32
+    }
+
+    /// Core 1 picked up a request stamped `stamp` on core 0.
+    pub fn inbound(idx: usize, stamp: u32) {
+        let us = now_us().wrapping_sub(stamp);
+        COUNTERS[idx][Field::InboundUs as usize].fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// Core 0 picked up a reply stamped `stamp` on core 1.
+    pub fn outbound(idx: usize, stamp: u32) {
+        let us = now_us().wrapping_sub(stamp);
+        COUNTERS[idx][Field::OutboundUs as usize].fetch_add(us, Ordering::Relaxed);
+    }
 
     /// The SWD worker on core 1 is about to run a command.
     #[inline]
@@ -122,6 +158,7 @@ mod enabled {
         pub fn worker_answered(&self, at: &Stamp) {
             let us = at.0.elapsed().as_micros() as u32;
             self.add(Field::Cmds);
+            COUNTERS[self.idx][Field::WorkerUs as usize].fetch_add(us, Ordering::Relaxed);
             self.max(Field::MaxWorkerUs, us);
             if us > SLOW_US {
                 self.add(Field::SlowWorker);
@@ -151,10 +188,18 @@ mod enabled {
                 }
                 _ => return None,
             }
+            if request.get(1) == Some(&RESET_ID) {
+                FIFO_YIELDS.store(0, Ordering::Relaxed);
+            }
             response[0] = request[0];
             response[1] = (FIELDS * 4) as u8;
             for (i, c) in COUNTERS[self.idx].iter().enumerate() {
-                response[2 + 4 * i..6 + 4 * i].copy_from_slice(&c.load(Ordering::Relaxed).to_le_bytes());
+                let v = if i == Field::FifoYields as usize {
+                    FIFO_YIELDS.load(Ordering::Relaxed)
+                } else {
+                    c.load(Ordering::Relaxed)
+                };
+                response[2 + 4 * i..6 + 4 * i].copy_from_slice(&v.to_le_bytes());
             }
             Some(2 + FIELDS * 4)
         }
@@ -173,6 +218,16 @@ mod disabled {
     }
     #[inline(always)]
     pub fn worker_done(_idx: usize, _b: Busy) {}
+    #[inline(always)]
+    pub fn fifo_yield() {}
+    #[inline(always)]
+    pub fn now_us() -> u32 {
+        0
+    }
+    #[inline(always)]
+    pub fn inbound(_idx: usize, _stamp: u32) {}
+    #[inline(always)]
+    pub fn outbound(_idx: usize, _stamp: u32) {}
 
     pub struct Lane;
 

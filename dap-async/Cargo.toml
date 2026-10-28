@@ -1,0 +1,13 @@
+[package]
+name = "dap-async"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Async, SWD-only CMSIS-DAP v2 command processor (derived from dap-rs)"
+
+[dependencies]
+embedded-hal-async = "1"
+defmt = { version = "1", optional = true }
+
+[features]
+defmt = ["dep:defmt"]

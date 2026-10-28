@@ -74,7 +74,13 @@ counts:
 - requests that arrived while the lane's previous reply was still armed and
   uncollected, with that reply's age;
 - core-1 time spent inside `process_command` for the lane, summed (`busy_us`,
-  wraps after ~71 min) and max; `mpdiag` derives `mean_busy_us` per command.
+  wraps after ~71 min) and max; `mpdiag` derives `mean_busy_us` per command;
+- request-to-answer time as core 0 sees it (`worker_us`, summed; `mean_worker_us`)
+  and its two cross-core halves, hand-off to worker start (`inbound_us`) and
+  worker end to pickup (`outbound_us`), so `worker - busy - in - out` is the
+  worker's own queueing behind other lanes;
+- `fifo_yields`: PIO FIFO waits that outlived the spin budget and yielded to
+  the other lanes (global across lanes, reported on every lane).
 
 `mpdiag` prints them; `mpdiag --reset` zeroes every lane first, so the usual
 sequence is reset, run `mpstress`, read. Lanes held by another process are
@@ -96,24 +102,40 @@ Reading `/dev/usbmon*` needs the `wireshark` group (or root). At `-s 64` a
 6-lane churn run fills about 300 MB every 1.5 minutes. `/tmp` is often RAM, so
 size the ring accordingly.
 
-## Baselines (fw 0.1.2, RP2350-Zero, 9 lanes, RP2350 targets; issue #4)
+## Baselines (RP2350-Zero fixture, RP2350 targets, Genesys hub on an AMD root hub; issue #4/#5)
+
+`--size 4096 --secs 20`, lanes 0, 1, 2, 5, 7, 8. "async" is the issue-#5
+firmware (dap-async + yielding workers); 0.1.2 is the blocking engine.
 
 Bulk ROM read, KB/s:
 
-| SWD clock | 1 lane | aggregate, 6 lanes |
-|---|---|---|
-| 100 kHz | 5.6 | — |
-| 1 MHz | 43.5 | 55 |
-| 4 MHz | 97 | 168 |
-| 20 MHz | 150 | 358 |
+| SWD clock | 1 lane 0.1.2 | 1 lane async | 6 lanes 0.1.2 | 6 lanes async |
+|---|---|---|---|---|
+| 100 kHz | 5.8 | 6.7 | — | — |
+| 1 MHz | 47.4 | 52.9 | 55.6 | 194 (5 lanes; one attach failed) |
+| 4 MHz | 118.9 | 124.1 | 175 | 303 |
+| 20 MHz | 201.8 | 203.4 | 391 | 466 |
 
-- **One lane above ~4 MHz** is bound by the USB round trip. The aggregate is
-  bound by core 1, which runs every lane's SWD; lanes share it round-robin, one
-  DAP command each.
-- **Head-of-line blocking.** One 100 kHz lane drags a 20 MHz neighbour from
-  120 to 6.4 KB/s; its word round trip goes from 1.7 to 38 ms.
-- **Churn (6 lanes, 4 MHz).** About 7–9.5 open/attach/close cycles per second
-  per lane; attach p50 105 ms on a root port.
+Word op (DCRDR write + readback) on one 20 MHz lane: p50 771 µs / 1284 op/s
+(0.1.2) → 723 µs / 1374 op/s (async).
+
+Head-of-line blocking: lane 0 bulk @ 20 MHz, lane 1 word @ 20 MHz, slow
+lanes bulk @ 100 kHz.
+
+| Setup | lane 0 bulk KB/s 0.1.2 → async | lane 1 word p50 0.1.2 → async |
+|---|---|---|
+| 2 fast | 187 → 194 | 1.23 → 1.15 ms |
+| + 1 slow | 6.0 → 175 | 37.3 → 1.26 ms |
+| + 4 slow | 1.9 → 158 | 130.6 → 1.42 ms |
+
+- **One lane above ~4 MHz** is bound by the USB round trip; behind a hub
+  that round trip is quantized to 125 µs microframes, so single-lane
+  numbers move in steps with device time.
+- **Core-1 cost per 14-word block at 20 MHz** (`busy_us`): 72 µs (0.1.2) vs
+  ~83 µs (async), of which ~40 µs is wire time; the cross-core hand-off
+  (`inbound_us` + `outbound_us`) is ~13 µs per command.
+- **Churn (6 lanes, 4 MHz, 0.1.2).** About 7–9.5 open/attach/close cycles per
+  second per lane; attach p50 105 ms on a root port.
 - **Reply stalls depend on the USB path, not the firmware:**
 
   | Path | Stalls |

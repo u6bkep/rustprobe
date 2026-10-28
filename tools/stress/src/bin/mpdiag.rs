@@ -16,8 +16,9 @@ const DIAG_INFO_ID: u8 = 0xA0;
 /// Zeroes the lane's counters, then returns them.
 const DIAG_RESET_ID: u8 = 0xA1;
 /// Field order of the 0xA0 reply (u32 LE each), as defined by the firmware.
-const FIELDS: [&str; 9] = [
+const FIELDS: [&str; 13] = [
     "cmds", "slow_worker", "max_worker_us", "unread", "max_unread_ms", "slow_arm", "max_arm_us", "busy_us", "max_busy_us",
+    "fifo_yields", "worker_us", "inbound_us", "outbound_us",
 ];
 const TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -85,16 +86,26 @@ fn read_lane(dev: &nusb::Device, lane: u8, reset: bool) -> Result<String> {
     if reply.get(1) == Some(&0) {
         return Ok("no counters (firmware without stall-diag)".into());
     }
-    if reply.len() < 2 + 4 * FIELDS.len() || reply[1] as usize != 4 * FIELDS.len() {
+    // Older firmware reports a prefix of the field list.
+    let n = reply[1] as usize / 4;
+    if reply[1] % 4 != 0 || n > FIELDS.len() || reply.len() < 2 + 4 * n {
         bail!("unexpected reply {reply:02x?}");
     }
-    let values: Vec<u32> = (0..FIELDS.len())
+    let values: Vec<u32> = (0..n)
         .map(|i| u32::from_le_bytes(reply[2 + 4 * i..6 + 4 * i].try_into().unwrap()))
         .collect();
     let mut fields: Vec<String> = FIELDS.iter().zip(&values).map(|(name, v)| format!("{name}={v}")).collect();
-    let (cmds, busy_us) = (values[0], values[7]);
+    let cmds = values[0];
     if cmds > 0 {
-        fields.push(format!("mean_busy_us={:.1}", busy_us as f64 / cmds as f64));
+        if let Some(busy_us) = values.get(7) {
+            fields.push(format!("mean_busy_us={:.1}", *busy_us as f64 / cmds as f64));
+        }
+        if let Some(worker_us) = values.get(10) {
+            fields.push(format!("mean_worker_us={:.1}", *worker_us as f64 / cmds as f64));
+        }
+        if let (Some(i), Some(o)) = (values.get(11), values.get(12)) {
+            fields.push(format!("in/cmd={:.1} out/cmd={:.1}", *i as f64 / cmds as f64, *o as f64 / cmds as f64));
+        }
     }
     Ok(fields.join(" "))
 }

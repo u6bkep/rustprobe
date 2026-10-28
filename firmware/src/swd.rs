@@ -15,9 +15,15 @@
 //! `Count` is the number of bits transferred, minus 1. `Dir` is the SWDIO
 //! output enable. `Cmd` is the absolute PIO address of the `write_cmd`,
 //! `read_cmd` or `get_next_cmd` routine. One SWCLK period is 4 SM cycles.
+//!
+//! The engine's FIFOs are reached two ways: [`FifoRegs`] gives the async
+//! driver in `dap.rs` raw register access for its hot loop, and the
+//! object-safe [`SwdBus`] carries everything else (clock, direction, nRESET),
+//! so one driver type serves every PIO block / state machine combination.
 
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::gpio::{AnyPin, Flex, Pull};
+use embassy_rp::pac;
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
     Common, Config, Direction as PioDirection, Instance, LoadedProgram, Pin as PioPinHandle,
@@ -26,16 +32,87 @@ use embassy_rp::pio::{
 use embassy_rp::Peri;
 use fixed::traits::ToFixed;
 
+/// A PIO block's register block, for [`FifoRegs`]. embassy-rp keeps the
+/// equivalent item sealed.
+pub trait PioBlock: Instance {
+    /// Register block.
+    const PAC: pac::pio::Pio;
+}
+
+impl PioBlock for embassy_rp::peripherals::PIO0 {
+    const PAC: pac::pio::Pio = pac::PIO0;
+}
+
+impl PioBlock for embassy_rp::peripherals::PIO1 {
+    const PAC: pac::pio::Pio = pac::PIO1;
+}
+
+#[cfg(feature = "rp2350")]
+impl PioBlock for embassy_rp::peripherals::PIO2 {
+    const PAC: pac::pio::Pio = pac::PIO2;
+}
+
 /// Jump targets within the loaded PIO program (absolute addresses).
 #[derive(Clone, Copy)]
-struct CmdAddrs {
-    write: u8,
+pub struct CmdAddrs {
+    pub write: u8,
     /// `get_next_cmd`: a no-op command that only applies `Dir` — used to
     /// switch SWDIO direction without clocking.
-    skip: u8,
+    pub skip: u8,
     /// Alias of `write` in the RAW-IO program; clocks with SWDIO released.
-    turnaround: u8,
-    read: u8,
+    pub turnaround: u8,
+    pub read: u8,
+}
+
+impl CmdAddrs {
+    /// Format a command word: `bits` (1..=256) transferred, SWDIO output
+    /// enable, routine address.
+    #[inline(always)]
+    pub fn cmd(bits: u32, out_en: bool, addr: u8) -> u32 {
+        ((bits - 1) & 0xff) | ((out_en as u32) << 8) | ((addr as u32) << 9)
+    }
+}
+
+/// Raw access to one state machine's FIFOs, for the driver's hot loop:
+/// a `dyn` call per FIFO word costs more than the word itself.
+///
+/// The pointers come from the PAC and stay valid for the firmware's life;
+/// the engine that handed them out owns the state machine exclusively, so
+/// whoever holds the engine may use them.
+#[derive(Clone, Copy)]
+pub struct FifoRegs {
+    fstat: *const u32,
+    txf: *mut u32,
+    rxf: *const u32,
+    txfull: u32,
+    rxempty: u32,
+}
+
+unsafe impl Send for FifoRegs {}
+
+impl FifoRegs {
+    /// Push one TX FIFO entry if there is room.
+    #[inline(always)]
+    pub fn try_push(&self, v: u32) -> bool {
+        unsafe {
+            if self.fstat.read_volatile() & self.txfull != 0 {
+                return false;
+            }
+            self.txf.write_volatile(v);
+        }
+        true
+    }
+
+    /// Take one RX FIFO entry if there is one.
+    #[inline(always)]
+    pub fn try_pull(&self) -> Option<u32> {
+        unsafe {
+            if self.fstat.read_volatile() & self.rxempty != 0 {
+                return None;
+            }
+            Some(self.rxf.read_volatile())
+        }
+    }
 }
 
 /// The SWD PIO program, loaded once per PIO block and shared by its state
@@ -82,57 +159,31 @@ impl<'d, P: Instance> SwdProgram<'d, P> {
     }
 }
 
-/// Object-safe SWD wire operations — what the DAP layer needs from an
-/// engine, independent of which PIO block / state machine backs it.
+/// Object-safe, non-blocking view of one engine — what the async driver in
+/// `dap.rs` needs, independent of which PIO block / state machine backs it.
+///
+/// The hot path moves FIFO words through [`FifoRegs`] directly.
 pub trait SwdBus: Send {
     /// Set the SWCLK frequency.
     fn set_swclk_freq_khz(&mut self, freq_khz: u32);
-    /// Clock out `bit_count` (1..=32) bits, LSB first, driving SWDIO.
-    fn write_bits(&mut self, bit_count: u32, data: u32);
-    /// Clock in `bit_count` (1..=32) bits, LSB first, SWDIO released.
-    fn read_bits(&mut self, bit_count: u32) -> u32;
-    /// Run `bit_count` clocks with SWDIO released (turnaround / line idle).
-    fn hiz_clocks(&mut self, bit_count: u32);
-    /// Switch SWDIO to input (probe releases the line). Blocks until applied.
-    fn read_mode(&mut self);
-    /// Switch SWDIO to output (probe drives the line). Blocks until applied.
-    fn write_mode(&mut self);
+    /// The SWCLK frequency last set.
+    fn swclk_khz(&self) -> u32;
+    /// Raw FIFO registers of this engine's state machine.
+    fn fifo(&self) -> FifoRegs;
+    /// Command routine addresses of this engine's program.
+    fn addrs(&self) -> CmdAddrs;
+    /// Read-and-clear: the SM has stalled on `pull` (TX FIFO drained) since
+    /// the last call.
+    fn tx_stalled(&mut self) -> bool;
     /// Drive (true) or release (false) the nRESET line.
     fn set_nreset(&mut self, asserted: bool);
     /// Current level of the nRESET line (true = high / released).
     fn nreset_level(&mut self) -> bool;
 }
 
-impl<'d, P: Instance + Send, const SM: usize> SwdBus for SwdEngine<'d, P, SM> {
-    fn set_swclk_freq_khz(&mut self, freq_khz: u32) {
-        SwdEngine::set_swclk_freq_khz(self, freq_khz)
-    }
-    fn write_bits(&mut self, bit_count: u32, data: u32) {
-        SwdEngine::write_bits(self, bit_count, data)
-    }
-    fn read_bits(&mut self, bit_count: u32) -> u32 {
-        SwdEngine::read_bits(self, bit_count)
-    }
-    fn hiz_clocks(&mut self, bit_count: u32) {
-        SwdEngine::hiz_clocks(self, bit_count)
-    }
-    fn read_mode(&mut self) {
-        SwdEngine::read_mode(self)
-    }
-    fn write_mode(&mut self) {
-        SwdEngine::write_mode(self)
-    }
-    fn set_nreset(&mut self, asserted: bool) {
-        SwdEngine::set_nreset(self, asserted)
-    }
-    fn nreset_level(&mut self) -> bool {
-        SwdEngine::nreset_level(self)
-    }
-}
-
 /// One SWD probe instance: a PIO state machine driving SWCLK/SWDIO, plus an
 /// optional open-drain-emulated nRESET pin.
-pub struct SwdEngine<'d, P: Instance, const SM: usize> {
+pub struct SwdEngine<'d, P: PioBlock, const SM: usize> {
     sm: StateMachine<'d, P, SM>,
     addrs: CmdAddrs,
     nreset: Option<Flex<'d>>,
@@ -140,7 +191,7 @@ pub struct SwdEngine<'d, P: Instance, const SM: usize> {
     cached_freq_khz: u32,
 }
 
-impl<'d, P: Instance, const SM: usize> SwdEngine<'d, P, SM> {
+impl<'d, P: PioBlock, const SM: usize> SwdEngine<'d, P, SM> {
     /// Set up GPIOs and start the state machine idling in `get_next_cmd`.
     /// `program` must be loaded into the same PIO block as `sm`.
     pub fn new(
@@ -197,22 +248,6 @@ impl<'d, P: Instance, const SM: usize> SwdEngine<'d, P, SM> {
         this
     }
 
-    fn fmt_command(&self, bit_count: u32, out_en: bool, cmd_addr: u8) -> u32 {
-        ((bit_count - 1) & 0xff) | ((out_en as u32) << 8) | ((cmd_addr as u32) << 9)
-    }
-
-    fn push_blocking(&mut self, v: u32) {
-        while !self.sm.tx().try_push(v) {}
-    }
-
-    fn pull_blocking(&mut self) -> u32 {
-        loop {
-            if let Some(v) = self.sm.rx().try_pull() {
-                return v;
-            }
-        }
-    }
-
     /// Set the SWCLK frequency. One SWCLK period is 4 SM cycles.
     pub fn set_swclk_freq_khz(&mut self, freq_khz: u32) {
         if freq_khz == self.cached_freq_khz || freq_khz == 0 {
@@ -225,60 +260,32 @@ impl<'d, P: Instance, const SM: usize> SwdEngine<'d, P, SM> {
         self.sm.set_clock_divider(divider.to_fixed());
         defmt::debug!("SWCLK {} kHz -> divider {}", freq_khz, divider);
     }
+}
 
-    /// Clock out `bit_count` (1..=32) bits, LSB first, driving SWDIO.
-    pub fn write_bits(&mut self, bit_count: u32, data: u32) {
-        let cmd = self.fmt_command(bit_count, true, self.addrs.write);
-        self.push_blocking(cmd);
-        self.push_blocking(data);
+impl<'d, P: PioBlock + Send, const SM: usize> SwdBus for SwdEngine<'d, P, SM> {
+    fn set_swclk_freq_khz(&mut self, freq_khz: u32) {
+        SwdEngine::set_swclk_freq_khz(self, freq_khz)
     }
-
-    /// Clock in `bit_count` (1..=32) bits, LSB first, SWDIO released.
-    pub fn read_bits(&mut self, bit_count: u32) -> u32 {
-        let cmd = self.fmt_command(bit_count, false, self.addrs.read);
-        self.push_blocking(cmd);
-        let data = self.pull_blocking();
-        if bit_count < 32 {
-            data >> (32 - bit_count)
-        } else {
-            data
+    fn swclk_khz(&self) -> u32 {
+        self.cached_freq_khz
+    }
+    fn fifo(&self) -> FifoRegs {
+        // FSTAT: RXEMPTY at bits 8..11, TXFULL at bits 16..19, one per SM.
+        FifoRegs {
+            fstat: P::PAC.fstat().as_ptr() as *const u32,
+            txf: P::PAC.txf(SM).as_ptr(),
+            rxf: P::PAC.rxf(SM).as_ptr() as *const u32,
+            txfull: 1 << (16 + SM),
+            rxempty: 1 << (8 + SM),
         }
     }
-
-    /// Run `bit_count` clocks with SWDIO released (turnaround / line idle).
-    pub fn hiz_clocks(&mut self, bit_count: u32) {
-        if bit_count == 0 {
-            return;
-        }
-        let cmd = self.fmt_command(bit_count, false, self.addrs.turnaround);
-        self.push_blocking(cmd);
-        self.push_blocking(0);
+    fn addrs(&self) -> CmdAddrs {
+        self.addrs
     }
-
-    /// Busy-wait until the SM has drained the TX FIFO and stalled on `pull`,
-    /// i.e. all queued commands have completed on the wire.
-    fn wait_idle(&mut self) {
-        // `stalled()` is read-then-clear: first call clears any stale flag.
-        self.sm.tx().stalled();
-        while !self.sm.tx().stalled() {}
+    fn tx_stalled(&mut self) -> bool {
+        self.sm.tx().stalled()
     }
-
-    /// Switch SWDIO to input (probe releases the line). Blocks until applied.
-    pub fn read_mode(&mut self) {
-        let cmd = self.fmt_command(1, false, self.addrs.skip);
-        self.push_blocking(cmd);
-        self.wait_idle();
-    }
-
-    /// Switch SWDIO to output (probe drives the line). Blocks until applied.
-    pub fn write_mode(&mut self) {
-        let cmd = self.fmt_command(1, true, self.addrs.skip);
-        self.push_blocking(cmd);
-        self.wait_idle();
-    }
-
-    /// Drive (true) or release (false) the nRESET line.
-    pub fn set_nreset(&mut self, asserted: bool) {
+    fn set_nreset(&mut self, asserted: bool) {
         if let Some(nreset) = &mut self.nreset {
             if asserted {
                 nreset.set_as_output();
@@ -287,9 +294,7 @@ impl<'d, P: Instance, const SM: usize> SwdEngine<'d, P, SM> {
             }
         }
     }
-
-    /// Current level of the nRESET line (true = high / released).
-    pub fn nreset_level(&mut self) -> bool {
+    fn nreset_level(&mut self) -> bool {
         match &mut self.nreset {
             Some(nreset) => nreset.is_high(),
             None => true,

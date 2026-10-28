@@ -20,7 +20,7 @@ use probe_config::{ProbeConfig, Topology, MAX_PROBES};
 use static_cell::StaticCell;
 
 use crate::autobaud::{AutobaudCapture, AutobaudSm};
-use crate::swd::{SwdBus, SwdEngine, SwdProgram};
+use crate::swd::{SwdBus, SwdEngine, SwdProgram, PioBlock};
 use crate::Irqs;
 
 /// A type-erased probe engine.
@@ -178,7 +178,7 @@ pub struct PioBlocks {
 /// prepared capture is returned. `reserve_sm3` is only set for a block that has
 /// fewer than four probes (so SM3 carries no probe), and only when a UART is
 /// configured — see [`build_engines`].
-fn block_engines<P: Instance + Send>(
+fn block_engines<P: PioBlock + Send>(
     pio: Pio<'static, P>,
     probes: &[ProbeConfig],
     pins: &mut PinTable,
